@@ -39,12 +39,8 @@ void put_log(char* log, u32 log_size, const char* what, const char* detail)
 
 bool glslang_ready()
 {
-    static bool inited = false;
-    if (!inited) {
-        if (!glslang::InitializeProcess()) return false;
-        inited = true;
-    }
-    return true;
+    static const bool inited = glslang::InitializeProcess();
+    return inited;
 }
 
 } // namespace

@@ -300,6 +300,8 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
  * through the built-in pair is not one of them. */
 u32  rsx_draw_engine_guest_draws(void);
 
+u64  rsx_draw_engine_decompile_ns(u32* count);
+
 /* The centre pixel of the surface the last flip presented, as A8R8G8B8 --
  * the convention the RSX clear colour arrives in, so a host can compare the
  * two. Zero when nothing has been presented or the surface is not an

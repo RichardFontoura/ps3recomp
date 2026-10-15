@@ -184,9 +184,10 @@ static struct {
     rsx_fp_constant_block fp_constants;
 } g;
 
-/* The decompilers' HLSL. The VP decompiler builds bodies up to 192 KB. */
 static char s_vs_hlsl[256 * 1024];
 static char s_ps_hlsl[256 * 1024];
+static u64 s_decompile_ns;
+static u32 s_decompiles;
 
 /* The draw accumulator: one BEGIN_END group's batches, references and cuts. */
 static struct {
@@ -1545,6 +1546,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     u32 handle = 0;
     int vi = 1, fi = 1;
     u32 nconst = 0;
+    struct timespec t0, t1;
+    timespec_get(&t0, TIME_UTC);
     if (fixed) {
         snprintf(s_vs_hlsl, sizeof s_vs_hlsl, "%s", kEngFixedVS);
         snprintf(s_ps_hlsl, sizeof s_ps_hlsl, "%s", kEngFixedPS);
@@ -1563,6 +1566,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                                              rs->alpha_func) < 0)
             fi = -1;
     }
+    timespec_get(&t1, TIME_UTC);
+    s_decompile_ns += (u64)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
+    s_decompiles++;
     if (vi > 0 && fi > 0)
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt, rt_count);
@@ -2773,6 +2779,12 @@ void rsx_draw_engine_note_flip(u32 buffer_id)
 u32 rsx_draw_engine_guest_draws(void)
 {
     return g.last_guest_draws;
+}
+
+u64 rsx_draw_engine_decompile_ns(u32* count)
+{
+    if (count) *count = s_decompiles;
+    return s_decompile_ns;
 }
 
 u32 rsx_draw_engine_readback_center(void)

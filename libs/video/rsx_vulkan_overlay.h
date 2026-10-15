@@ -30,6 +30,11 @@ typedef struct rsx_vk_overlay_swapchain {
     VkPresentModeKHR present_mode;
 } rsx_vk_overlay_swapchain;
 
+typedef struct rsx_vk_shader_stats {
+    uint32_t pipelines, variants, skipped_draws, pending, warmup_total, warmup_done;
+    double   frame_ms;
+} rsx_vk_shader_stats;
+
 typedef struct rsx_vk_overlay_hooks {
     void (*swapchain_ready)(const rsx_vk_overlay_context* context,
                             const rsx_vk_overlay_swapchain* swapchain, void* user);
@@ -44,6 +49,8 @@ void        rsx_vulkan_backend_set_vsync(int on);
 int         rsx_vulkan_backend_vsync(void);
 SDL_Window* rsx_vulkan_backend_window(void);
 const char* rsx_vulkan_backend_device_name(void);
+void        rsx_vulkan_backend_shader_stats(rsx_vk_shader_stats* out);
+void        rsx_vulkan_backend_save_shader_cache(void);
 
 #ifdef __cplusplus
 }
