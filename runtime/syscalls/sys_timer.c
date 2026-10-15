@@ -8,6 +8,7 @@
 #include "../memory/vm.h"
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
+#include <time.h>
 #include <stdlib.h>
 
 /* ---------------------------------------------------------------------------
@@ -313,6 +314,54 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
         write_be64(nsec_addr, nsec);
     }
 
+    return CELL_OK;
+}
+
+void lv2_host_timezone_at(int64_t unix_seconds, int32_t* timezone_minutes, int32_t* summertime_minutes)
+{
+    time_t instant = (time_t)unix_seconds;
+    struct tm local;
+#ifdef _WIN32
+    long west_seconds = 0, dst_bias_seconds = 0;
+    _tzset();
+    _get_timezone(&west_seconds);
+    _get_dstbias(&dst_bias_seconds);
+    localtime_s(&local, &instant);
+    *timezone_minutes = (int32_t)(-west_seconds / 60);
+    *summertime_minutes = local.tm_isdst > 0 ? (int32_t)(-dst_bias_seconds / 60) : 0;
+#else
+    tzset();
+    localtime_r(&instant, &local);
+    long standard = local.tm_gmtoff;
+    for (int month = 0; month < 12; month += 6) {
+        struct tm probe = {0};
+        probe.tm_year = local.tm_year;
+        probe.tm_mon = month;
+        probe.tm_mday = 1;
+        probe.tm_hour = 12;
+        probe.tm_isdst = -1;
+        time_t probe_time = mktime(&probe);
+        localtime_r(&probe_time, &probe);
+        if (probe.tm_gmtoff < standard)
+            standard = probe.tm_gmtoff;
+    }
+    *timezone_minutes = (int32_t)(standard / 60);
+    *summertime_minutes = local.tm_isdst > 0 ? (int32_t)((local.tm_gmtoff - standard) / 60) : 0;
+#endif
+}
+
+int64_t sys_time_get_timezone(ppu_context* ctx)
+{
+    uint32_t timezone_addr = LV2_ARG_PTR(ctx, 0);
+    uint32_t summertime_addr = LV2_ARG_PTR(ctx, 1);
+    int32_t timezone_minutes, summertime_minutes;
+
+    if (timezone_addr == 0 || summertime_addr == 0)
+        return (int64_t)(int32_t)CELL_EFAULT;
+
+    lv2_host_timezone_at((int64_t)time(NULL), &timezone_minutes, &summertime_minutes);
+    write_be32(timezone_addr, (uint32_t)timezone_minutes);
+    write_be32(summertime_addr, (uint32_t)summertime_minutes);
     return CELL_OK;
 }
 
@@ -680,4 +729,5 @@ void sys_timer_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_TIMER_USLEEP,            sys_timer_usleep);
     lv2_syscall_register(tbl, SYS_TIMER_SLEEP,             sys_timer_sleep);
     lv2_syscall_register(tbl, SYS_TIME_GET_CURRENT_TIME,   sys_time_get_current_time);
+    lv2_syscall_register(tbl, SYS_TIME_GET_TIMEZONE,       sys_time_get_timezone);
 }

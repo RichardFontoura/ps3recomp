@@ -139,6 +139,7 @@ extern uint32_t g_ps3_sdk_version;
 #define SYS_TIMER_SLEEP                 142
 
 /* Time */
+#define SYS_TIME_GET_TIMEZONE           144
 #define SYS_TIME_GET_CURRENT_TIME       145
 #define SYS_TIME_GET_TIMEBASE_FREQUENCY 147
 
@@ -198,6 +199,7 @@ extern uint32_t g_ps3_sdk_version;
 #define SYS_SPU_THREAD_BIND_QUEUE       193
 #define SYS_SPU_THREAD_UNBIND_QUEUE     194
 #define SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS 251
+#define SYS_SPU_THREAD_GROUP_LOG        254
 
 /* PRX (module) management */
 #define SYS_PRX_LOAD_MODULE             480

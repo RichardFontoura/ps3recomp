@@ -47,6 +47,14 @@ extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
 
 #include "../platform/win32_compat.h"   /* QueryPerformanceCounter shim for the SPU_SPEED timing */
 
+enum {
+    SPU_THREAD_GROUP_LOG_ON = 0,
+    SPU_THREAD_GROUP_LOG_OFF = 1,
+    SPU_THREAD_GROUP_LOG_GET_STATUS = 2,
+};
+
+static int32_t s_spu_thread_group_log_state = SPU_THREAD_GROUP_LOG_ON;
+
 /* ---------------------------------------------------------------------------
  * TTY syscalls (used by PS3 CRT for debug output)
  *
@@ -2385,6 +2393,26 @@ static int64_t sys_spu_thread_stub(ppu_context* ctx)
     return 0;
 }
 
+static int64_t sys_spu_thread_group_log_handler(ppu_context* ctx)
+{
+    int32_t command = LV2_ARG_S32(ctx, 0);
+    uint32_t stat_addr = LV2_ARG_PTR(ctx, 1);
+
+    switch (command) {
+    case SPU_THREAD_GROUP_LOG_GET_STATUS:
+        if (stat_addr == 0)
+            return (int64_t)(int32_t)CELL_EFAULT;
+        vm_write_be32(stat_addr, (uint32_t)__atomic_load_n(&s_spu_thread_group_log_state, __ATOMIC_ACQUIRE));
+        return CELL_OK;
+    case SPU_THREAD_GROUP_LOG_ON:
+    case SPU_THREAD_GROUP_LOG_OFF:
+        __atomic_store_n(&s_spu_thread_group_log_state, command, __ATOMIC_RELEASE);
+        return CELL_OK;
+    default:
+        return (int64_t)(int32_t)CELL_EINVAL;
+    }
+}
+
 
 
 /* sys_usbd_receive_event (540) -- a BLOCKING receive, not a poll.
@@ -2529,6 +2557,7 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_all_threads_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_LOG,       sys_spu_thread_group_log_handler);
 }
 
 /* ---------------------------------------------------------------------------

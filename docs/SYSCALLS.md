@@ -385,6 +385,7 @@ PS3 time is measured in **timebase ticks** at 79,800,000 Hz (79.8 MHz). This is 
 | 76 | `sys_timer_disconnect_event_queue` | Disconnect timer from queue. |
 | 141 | `sys_timer_usleep` | Sleep for N microseconds. |
 | 142 | `sys_timer_sleep` | Sleep for N seconds. |
+| 144 | `sys_time_get_timezone` | Writes the host's standard UTC offset and the current daylight-saving offset, both in minutes east (BE s32), to two guest pointers; `CELL_EFAULT` if either is null. |
 | 145 | `sys_time_get_current_time` | Get current time (seconds + nanoseconds since epoch). |
 | 147 | `sys_time_get_timebase_frequency` | Returns 79,800,000. |
 
@@ -505,7 +506,7 @@ In a full emulator, interrupts would trigger SPU-to-PPU signaling and preemption
 
 ## SPU Management
 
-**Syscall numbers:** 156–157, 170–194, 229–251
+**Syscall numbers:** 156–157, 170–194, 229–251, 254
 
 ### Status
 
@@ -516,6 +517,7 @@ SPU management syscalls are **defined but minimally implemented**. The full set 
 - `sys_spu_thread_write_ls/read_ls/write_snr`
 - `sys_spu_thread_bind_queue/unbind_queue`
 - `sys_spu_image_open/close`
+- `sys_spu_thread_group_log` (254): `command` 0 = log on, 1 = log off, 2 = write the current state (BE s32) to `stat`. The state starts on and is process-wide; nothing is logged by it. `CELL_EFAULT` for a null `stat` with command 2, `CELL_EINVAL` for any other command (RPCS3 `sys_spu.cpp`).
 
 Most games use the higher-level `cellSpurs` framework instead of raw SPU syscalls. The SPURS HLE module in `libs/spurs/` provides the management layer.
 

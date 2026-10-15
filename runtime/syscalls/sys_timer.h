@@ -72,6 +72,8 @@ extern sys_timer_info g_sys_timers[SYS_TIMER_MAX];
 int64_t sys_timer_usleep(ppu_context* ctx);
 int64_t sys_timer_sleep(ppu_context* ctx);
 int64_t sys_time_get_current_time(ppu_context* ctx);
+int64_t sys_time_get_timezone(ppu_context* ctx);
+void    lv2_host_timezone_at(int64_t unix_seconds, int32_t* timezone_minutes, int32_t* summertime_minutes);
 int64_t sys_time_get_timebase_frequency(ppu_context* ctx);
 int64_t sys_timer_create(ppu_context* ctx);
 int64_t sys_timer_destroy(ppu_context* ctx);
