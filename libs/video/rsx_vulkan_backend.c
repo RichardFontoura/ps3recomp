@@ -51,6 +51,7 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
+#include "rsx_vulkan_overlay.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 
@@ -106,7 +107,8 @@
  * headless run never depends on a driver that can present. */
 #define VK_WSI_INSTANCE_FNS(X) \
     X(vkDestroySurfaceKHR) X(vkGetPhysicalDeviceSurfaceSupportKHR) \
-    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR)
+    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR) \
+    X(vkGetPhysicalDeviceSurfacePresentModesKHR)
 #define VK_WSI_DEVICE_FNS(X) \
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) \
     X(vkAcquireNextImageKHR) X(vkQueuePresentKHR)
@@ -209,6 +211,11 @@ typedef struct vk_state {
     VkSemaphore      sc_done[8];      /* per image: the present waits on it */
     VkSemaphore      sem_acquire;
     double           hold_seconds;
+    int              sc_dirty;
+    int              vsync;
+    VkFormat         sc_format;
+    VkPresentModeKHR sc_present_mode;
+    char             device_name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
 
     const rsx_state* state;           /* live RSX state, for draws       */
     u32              clear_argb;
@@ -253,6 +260,11 @@ static struct {
     SDL_mutex*      lock;
     SDL_cond*       wake;
 } s_vp;
+
+static struct {
+    int                  on;
+    rsx_vk_overlay_hooks hooks;
+} s_ov;
 
 static int vk_flush(void);
 
@@ -407,6 +419,7 @@ static int vk_pick_device(void)
     /* Vulkan guarantees 4096; the engine's targets and textures may use what
      * the device really has (a title's 4608-wide target on RADV). */
     s_vk.max_dim = p.limits.maxImageDimension2D >= 4096u ? p.limits.maxImageDimension2D : 4096u;
+    snprintf(s_vk.device_name, sizeof s_vk.device_name, "%s", p.deviceName);
     VK_LOG("using device %d: %s\n", best, p.deviceName);
     return 0;
 }
@@ -1801,11 +1814,62 @@ static int vk_env_on(const char* name)
     return v && v[0] && v[0] != '0';
 }
 
+static int vk_overlay_on(void)
+{
+    return __atomic_load_n(&s_ov.on, __ATOMIC_ACQUIRE);
+}
+
+static void vk_overlay_swapchain_lost(void)
+{
+    if (vk_overlay_on() && s_vk.swapchain && s_ov.hooks.swapchain_lost)
+        s_ov.hooks.swapchain_lost(s_ov.hooks.user);
+}
+
+static VkPresentModeKHR vk_pick_present_mode(void)
+{
+    if (s_vk.vsync) return VK_PRESENT_MODE_FIFO_KHR;
+    u32 n = 0;
+    VkPresentModeKHR modes[16];
+    if (pvkGetPhysicalDeviceSurfacePresentModesKHR(s_vk.phys, s_vk.surface, &n, NULL) != VK_SUCCESS)
+        return VK_PRESENT_MODE_FIFO_KHR;
+    if (n > 16) n = 16;
+    if (pvkGetPhysicalDeviceSurfacePresentModesKHR(s_vk.phys, s_vk.surface, &n, modes) < 0)
+        return VK_PRESENT_MODE_FIFO_KHR;
+    static const VkPresentModeKHR pref[] = { VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR };
+    for (size_t k = 0; k < 2; k++)
+        for (u32 i = 0; i < n; i++)
+            if (modes[i] == pref[k]) return pref[k];
+    return VK_PRESENT_MODE_FIFO_KHR;
+}
+
+static void vk_overlay_swapchain_ready(VkImageUsageFlags usage, u32 min_count)
+{
+    if (!vk_overlay_on() || !s_ov.hooks.swapchain_ready ||
+        !(usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) return;
+    rsx_vk_overlay_context ctx = {
+        .get_instance_proc_addr = pvkGetInstanceProcAddr, .api_version = VK_API_VERSION_1_0,
+        .instance = s_vk.instance, .physical_device = s_vk.phys, .device = s_vk.device,
+        .queue_family = s_vk.queue_family, .queue = s_vp.on ? s_vp.queue : s_vk.queue,
+        .window = s_vk.window, .device_name = s_vk.device_name,
+    };
+    rsx_vk_overlay_swapchain sc = {
+        .format = s_vk.sc_format, .extent = s_vk.sc_extent, .min_image_count = min_count,
+        .image_count = s_vk.sc_count, .images = s_vk.sc_images, .present_mode = s_vk.sc_present_mode,
+    };
+    s_ov.hooks.swapchain_ready(&ctx, &sc, s_ov.hooks.user);
+}
+
+static int vk_overlay_record(VkCommandBuffer cmd, u32 idx)
+{
+    return vk_overlay_on() && s_ov.hooks.record && s_ov.hooks.record(cmd, idx, s_ov.hooks.user);
+}
+
 static void vk_window_drop(const char* why)
 {
     if (why) VK_LOG("window disabled, continuing headless: %s\n", why);
     if (s_vk.device && pvkDeviceWaitIdle) {
         pvkDeviceWaitIdle(s_vk.device);
+        vk_overlay_swapchain_lost();
         for (u32 i = 0; i < 8; i++)
             if (s_vk.sc_done[i]) {
                 pvkDestroySemaphore(s_vk.device, s_vk.sc_done[i], NULL);
@@ -1920,16 +1984,22 @@ static int vk_create_swapchain(void)
     for (size_t k = 0; k < 4; k++)
         if (caps.supportedCompositeAlpha & alphas[k]) { alpha = alphas[k]; break; }
 
+    __atomic_store_n(&s_vk.sc_dirty, 0, __ATOMIC_RELAXED);
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (vk_overlay_on() && (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+        usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    const VkPresentModeKHR mode = vk_pick_present_mode();
+    vk_overlay_swapchain_lost();
     VkSwapchainKHR old = s_vk.swapchain;
     VkSwapchainCreateInfoKHR sci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
         .surface = s_vk.surface, .minImageCount = count,
         .imageFormat = fmt.format, .imageColorSpace = fmt.colorSpace,
         .imageExtent = ext, .imageArrayLayers = 1,
-        .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .imageUsage = usage,
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .preTransform = caps.currentTransform, .compositeAlpha = alpha,
-        .presentMode = VK_PRESENT_MODE_FIFO_KHR,   /* the one mode every driver has */
+        .presentMode = mode,
         .clipped = VK_TRUE, .oldSwapchain = old,
     };
     VkSwapchainKHR sc = VK_NULL_HANDLE;
@@ -1955,7 +2025,11 @@ static int vk_create_swapchain(void)
 
     s_vk.sc_extent = ext;
     s_vk.sc_count = n;
-    VK_LOG("window swapchain %ux%u, %u images, format %d\n", ext.width, ext.height, n, (int)fmt.format);
+    s_vk.sc_format = fmt.format;
+    s_vk.sc_present_mode = mode;
+    VK_LOG("window swapchain %ux%u, %u images, format %d, present mode %d\n",
+           ext.width, ext.height, n, (int)fmt.format, (int)mode);
+    vk_overlay_swapchain_ready(usage, count);
     return 0;
 }
 
@@ -1969,6 +2043,10 @@ static void vk_present_window(void)
 {
     if (!s_vk.windowed || !s_vk.swapchain) return;
     vk_flush();
+    if (__atomic_load_n(&s_vk.sc_dirty, __ATOMIC_ACQUIRE)) {
+        vk_swapchain_lost();
+        if (!s_vk.windowed || !s_vk.swapchain) return;
+    }
 
     u32 idx = 0;
     VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
@@ -1999,12 +2077,14 @@ static void vk_present_window(void)
     pvkCmdBlitImage(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
                     s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     1, &blit, VK_FILTER_LINEAR);
-    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.dstAccessMask = 0;
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                          0, 0, NULL, 0, NULL, 1, &b);
+    if (!vk_overlay_record(s_vk.cmd, idx)) {
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = 0;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                              0, 0, NULL, 0, NULL, 1, &b);
+    }
     if (pvkEndCommandBuffer(s_vk.cmd) != VK_SUCCESS) {
         VK_LOG("vkEndCommandBuffer failed\n"); s_vb.recording = 0; vk_batch_retire(); return;
     }
@@ -2045,6 +2125,10 @@ static int vk_async_present_thread(void* unused)
         s_vp.pending = 0;
         SDL_UnlockMutex(s_vp.lock);
         if (quit) return 0;
+        if (__atomic_load_n(&s_vk.sc_dirty, __ATOMIC_ACQUIRE) && s_vk.swapchain) {
+            pvkQueueWaitIdle(s_vp.queue);
+            if (vk_create_swapchain()) VK_LOG("swapchain could not be recreated\n");
+        }
         u32 idx = 0;
         VkResult r = s_vk.swapchain
             ? pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX, s_vk.sem_acquire,
@@ -2078,12 +2162,14 @@ static int vk_async_present_thread(void* unused)
             pvkCmdBlitImage(s_vp.cmd, s_vp.img.img, VK_IMAGE_LAYOUT_GENERAL,
                             s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                             VK_FILTER_LINEAR);
-            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            b.dstAccessMask = 0;
-            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-            pvkCmdPipelineBarrier(s_vp.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                                  0, 0, NULL, 0, NULL, 1, &b);
+            if (!vk_overlay_record(s_vp.cmd, idx)) {
+                b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                b.dstAccessMask = 0;
+                b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                pvkCmdPipelineBarrier(s_vp.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+            }
             pvkEndCommandBuffer(s_vp.cmd);
             VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
             VkSubmitInfo si = {
@@ -3830,6 +3916,8 @@ static int vk_init_all(u32 width, u32 height, const char* title)
 {
     s_vk.width  = width  ? width  : 1280;
     s_vk.height = height ? height : 720;
+    { const char* v = getenv("PS3RECOMP_VK_VSYNC");
+      s_vk.vsync = !(v && v[0] == '0'); }
     s_vk.dump_path = getenv("PS3RECOMP_VK_DUMP");
     /* Writing a full frame to disk on every present costs more than the
      * present itself and slows a title enough to change what it does; a
@@ -4048,6 +4136,7 @@ void rsx_vulkan_backend_shutdown(void)
     if (s_vk.lib) dlclose(s_vk.lib);
     free(s_vk.cpu_verts);
     memset(&s_vk, 0, sizeof s_vk);
+    memset(&s_ov, 0, sizeof s_ov);
 }
 
 int rsx_vulkan_backend_pump_messages(void)
@@ -4056,12 +4145,36 @@ int rsx_vulkan_backend_pump_messages(void)
     int quit = 0;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
+        if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
+            __atomic_store_n(&s_vk.sc_dirty, 1, __ATOMIC_RELEASE);
+        if (vk_overlay_on() && s_ov.hooks.event && s_ov.hooks.event(&e, s_ov.hooks.user)) continue;
         if (e.type == SDL_QUIT) quit = 1;
         else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE &&
                  !vk_env_on("PS3RECOMP_VK_KEEP_ESCAPE")) quit = 1;
     }
     return quit ? -1 : 0;
 }
+
+int rsx_vulkan_overlay_register(const rsx_vk_overlay_hooks* hooks)
+{
+    if (!hooks || !s_vk.windowed || !s_vk.swapchain || vk_overlay_on()) return -1;
+    s_ov.hooks = *hooks;
+    __atomic_store_n(&s_ov.on, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_vk.sc_dirty, 1, __ATOMIC_RELEASE);
+    return 0;
+}
+
+void rsx_vulkan_backend_set_vsync(int on)
+{
+    s_vk.vsync = on ? 1 : 0;
+    __atomic_store_n(&s_vk.sc_dirty, 1, __ATOMIC_RELEASE);
+}
+
+int rsx_vulkan_backend_vsync(void) { return s_vk.vsync; }
+
+SDL_Window* rsx_vulkan_backend_window(void) { return s_vk.window; }
+
+const char* rsx_vulkan_backend_device_name(void) { return s_vk.device_name; }
 
 void rsx_vulkan_backend_present(void)
 {

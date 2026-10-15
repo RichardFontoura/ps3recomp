@@ -356,6 +356,8 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits);
 s32 cellSpursEventFlagGetDirection(CellSpursEventFlag* eventFlag,
                                    u32* direction);
 
+unsigned long long cellSpurs_kernel_busy_ns(unsigned wid);
+
 #ifdef __cplusplus
 }
 #endif

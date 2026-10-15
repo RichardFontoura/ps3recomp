@@ -1829,6 +1829,7 @@ static WklPm s_wkl_pm[CELL_SPURS_MAX_WORKLOAD2];
 
 static unsigned long long s_kern_busy_ns[CELL_SPURS_MAX_WORKLOAD2];
 static unsigned s_kern_work_runs[CELL_SPURS_MAX_WORKLOAD2];
+static unsigned long long s_kern_busy_total_ns[CELL_SPURS_MAX_WORKLOAD2];
 
 static unsigned long long spurs_kern_now_ns(void)
 {
@@ -1841,7 +1842,14 @@ static void spurs_kern_stats_time(u32 wid, unsigned long long ns, int found_work
 {
     if (wid >= CELL_SPURS_MAX_WORKLOAD2) return;
     s_kern_busy_ns[wid] += ns;
+    __atomic_fetch_add(&s_kern_busy_total_ns[wid], ns, __ATOMIC_RELAXED);
     if (found_work) s_kern_work_runs[wid]++;
+}
+
+unsigned long long cellSpurs_kernel_busy_ns(unsigned wid)
+{
+    if (wid >= CELL_SPURS_MAX_WORKLOAD2) return 0;
+    return __atomic_load_n(&s_kern_busy_total_ns[wid], __ATOMIC_RELAXED);
 }
 
 static void spurs_kern_stats_note(u32 wid, int kicked, u8 ready)
