@@ -94,6 +94,10 @@ const char* rsx_fp_opcode_name(u32 op)
     case OP_TXL: return "TXL"; case OP_TXB: return "TXB"; case OP_RFL: return "RFL";
     case OP_DIV: return "DIV"; case OP_DP2: return "DP2"; case OP_NRM: return "NRM";
     case OP_DIVSQ: return "DIVSQ"; case OP_LIF: return "LIF";
+    case OP_PK4B: return "PK4B"; case OP_UP4B: return "UP4B";
+    case OP_PK2H: return "PK2H"; case OP_UP2H: return "UP2H";
+    case OP_PK4UB: return "PK4UB"; case OP_UP4UB: return "UP4UB";
+    case OP_PK2US: return "PK2US"; case OP_UP2US: return "UP2US";
     case OP_FENCT: return "FENCT"; case OP_FENCB: return "FENCB";
     default:     return "?";
     }
@@ -458,6 +462,7 @@ static int rsx_fp_decompile_internal(
     int count = 0;
     u32 off = 0;
     u32 constant_slot = 0;
+    u32 pack_ops = 0;
 
     /* Open IFE/LOOP/REP blocks: the byte offset each one's else branch starts
      * at (0 = none) and where it ends. See the branch case below. */
@@ -624,6 +629,18 @@ static int rsx_fp_decompile_internal(
         case OP_MAX: snprintf(rhs, sizeof(rhs), "max((%s), (%s))", a, b); break;
         case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
         case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
+        case OP_DDX: snprintf(rhs, sizeof(rhs), "ddx(%s)", a); break;
+        case OP_DDY: snprintf(rhs, sizeof(rhs), "ddy(%s)", a); break;
+        case OP_PK4B: case OP_UP4B: case OP_PK2H: case OP_UP2H:
+        case OP_PK4UB: case OP_UP4UB: case OP_PK2US: case OP_UP2US: {
+            const char* fn = opcode == OP_PK4B ? "rsx_pk4b" : opcode == OP_UP4B ? "rsx_up4b"
+                           : opcode == OP_PK2H ? "rsx_pk2h" : opcode == OP_UP2H ? "rsx_up2h"
+                           : opcode == OP_PK4UB ? "rsx_pkb" : opcode == OP_UP4UB ? "rsx_upb"
+                           : opcode == OP_PK2US ? "rsx_pk16" : "rsx_up16";
+            snprintf(rhs, sizeof(rhs), "%s(%s)", fn, a);
+            pack_ops = 1;
+            break;
+        }
         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
         /* Real RSX RSQ ignores the input's sign — 1/sqrt(|x|), not 1/sqrt(x)
          * (oracle: RPCS3 FragmentProgramDecompiler.cpp, "RSQ ignores the sign
@@ -877,7 +894,7 @@ static int rsx_fp_decompile_internal(
     /* Preamble: PSInput matches the backend's placeholder layout; temp/half
      * register files; texture+sampler banks for TEX. Built here, in front of
      * the body, now that the return type is known. */
-    char preamble[2048];
+    char preamble[4096];
     Out p = { preamble, sizeof(preamble), 0, 1 };
     preamble[0] = '\0';
     out_puts(&p,
@@ -904,6 +921,22 @@ static int rsx_fp_decompile_internal(
     out_puts(&p,
         "SamplerState rsx_samp[16] : register(s0);\n"
     );
+    if (pack_ops)
+        out_puts(&p,
+            "float4 rsx_pk2h(float4 v) { return (float4)asfloat(f32tof16(v.x) | (f32tof16(v.y) << 16)); }\n"
+            "float4 rsx_up2h(float4 v) { uint u = asuint(v.x); return float2(f16tof32(u), f16tof32(u >> 16)).xyxy; }\n"
+            "float4 rsx_pkb(float4 v) { uint4 q = (uint4)round(saturate(v) * 255.0);"
+            " return (float4)asfloat(q.x | (q.y << 8) | (q.z << 16) | (q.w << 24)); }\n"
+            "float4 rsx_upb(float4 v) { uint u = asuint(v.x);"
+            " return float4(u & 0xFFu, (u >> 8) & 0xFFu, (u >> 16) & 0xFFu, u >> 24) / 255.0; }\n"
+            "float4 rsx_pk4b(float4 v) { uint4 q = (uint4)(int4)round(clamp(v, -1.0, 1.0) * 127.0) & 0xFFu;"
+            " return (float4)asfloat(q.x | (q.y << 8) | (q.z << 16) | (q.w << 24)); }\n"
+            "float4 rsx_up4b(float4 v) { uint u = asuint(v.x);"
+            " int4 s = asint(uint4(u << 24, u << 16, u << 8, u)) >> 24;"
+            " return clamp((float4)s / 127.0, -1.0, 1.0); }\n"
+            "float4 rsx_pk16(float4 v) { uint2 q = (uint2)round(saturate(v.xy) * 65535.0);"
+            " return (float4)asfloat(q.x | (q.y << 16)); }\n"
+            "float4 rsx_up16(float4 v) { uint u = asuint(v.x); return (float2(u & 0xFFFFu, u >> 16) / 65535.0).xyxy; }\n");
     if (buffered) {
         char constants_decl[192];
         snprintf(

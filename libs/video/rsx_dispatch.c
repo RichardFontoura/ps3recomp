@@ -344,12 +344,11 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         const u32 slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2] + (word >> 2);
         if (slot < RSX_DSP_NUM_CONSTANTS)
             rsx->constants[slot][word & 3] = arg;
-        /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
-         * slot range (first 400) -- what a shader's constants really were. */
-        { static int lo = -2, hi = 0, n = 0;
+        { static int lo = -2, hi = 0, n = 0, skip = 0;
           if (lo == -2) { const char* e = getenv("RSX_CONST_LOG"); lo = -1;
-                          if (e) sscanf(e, "%d,%d", &lo, &hi); }
-          if (lo >= 0 && (int)slot >= lo && (int)slot <= hi && n < 400) { n++;
+                          if (e) sscanf(e, "%d,%d,%d", &lo, &hi, &skip); }
+          if (lo >= 0 && (int)slot >= lo && (int)slot <= hi && skip > 0) skip--;
+          else if (lo >= 0 && (int)slot >= lo && (int)slot <= hi && n < 400) { n++;
               fprintf(stderr, "[const-load] c[%u].%c = 0x%08X (method 0x%04X id=%u)\n", slot,
                       "xyzw"[word & 3], arg, method, rsx->regs[M_VP_UPLOAD_CONST_ID >> 2]); } }
         return;
@@ -408,6 +407,13 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
             rsx->inline_len = 0;
             rsx->inline_dropped++;
         }
+        break;
+
+    case 0x180C:
+    case 0x1810:
+        { static int n; if (n++ < 8)
+            fprintf(stderr, "[rsx] ARRAY_ELEMENT%s 0x%08X not handled\n",
+                    method == 0x180C ? "16" : "32", arg); }
         break;
 
     case M_VB_VERTEX_BATCH:

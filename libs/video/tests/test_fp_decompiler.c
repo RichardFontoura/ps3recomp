@@ -106,6 +106,40 @@ int main(void)
                                   "    return (_o == _o) ? _o : (float4)0;\n}\n");
     }
 
+    {
+        u8 prog[32];
+        put_word(prog + 0, OPC(0x15) | OUTMASK_ALL | OUTREG(1));
+        put_word(prog + 4, T_INPUT | INSRC(4) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x16) | OUTMASK_ALL | OUTREG(2) | END);
+        put_word(prog + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("ddx", hlsl, "r[1].xyzw = _v.xyzw");
+        check("ddx_expr", hlsl, "ddx(");
+        check("ddy_expr", hlsl, "ddy(");
+        check_absent("ddx_ddy_handled", hlsl, "unhandled FP opcode");
+    }
+
+    {
+        u8 prog[32];
+        put_word(prog + 0, OPC(0x24) | OUTMASK_ALL | OUTREG(1));
+        put_word(prog + 4, T_INPUT | INSRC(1) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x28) | OUTMASK_ALL | END);
+        put_word(prog + 20, T_TEMP | REG(1) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("pk2h", hlsl, "rsx_pk2h(");
+        check("upb", hlsl, "rsx_upb(");
+        check("pack_helpers", hlsl, "float4 rsx_upb(float4 v)");
+        check_absent("pack_handled", hlsl, "unhandled FP opcode");
+    }
+
     /* Test 2: MUL r1.xy, r0, r0  (partial write mask). */
     {
         u8 prog[16];

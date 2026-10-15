@@ -663,6 +663,31 @@ static void test_remap_g8b8_lanes(void)
     for (int i = 0; i < 4; i++) CHECK_EQ(n[i], m[i]);
 }
 
+static void test_remap_x16_alpha_from_g(void)
+{
+    u8 m[4];
+    rsx_texture_component_remap(0xAAEEu, FMT_X16 | FMT_LN, m);
+    CHECK_EQ(m[A_], 0); CHECK_EQ(m[R_], RSX_REMAP_ONE);
+    CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], RSX_REMAP_ONE);
+}
+
+static void test_remap_single_channel_float_and_depth(void)
+{
+    const u32 fmts[3] = {FMT_X32F, FMT_DEPTH24, FMT_DEPTH16};
+    for (int f = 0; f < 3; f++) {
+        u8 m[4];
+        rsx_texture_component_remap(0xAAE4u, fmts[f], m);
+        for (int i = 0; i < 4; i++) CHECK_EQ(m[i], 0);
+    }
+    u8 y[4];
+    rsx_texture_component_remap(0xAAE4u, FMT_Y16X16, y);
+    CHECK_EQ(y[A_], 1); CHECK_EQ(y[R_], 0); CHECK_EQ(y[G_], 1); CHECK_EQ(y[B_], 0);
+    rsx_texture_component_remap(0xAAE4u, FMT_Y16X16F, y);
+    CHECK_EQ(y[A_], 0); CHECK_EQ(y[R_], 1); CHECK_EQ(y[G_], 0); CHECK_EQ(y[B_], 1);
+    rsx_texture_component_remap(0xAAE4u, FMT_D8R8G8B8, y);
+    CHECK_EQ(y[A_], RSX_REMAP_ONE); CHECK_EQ(y[R_], 0); CHECK_EQ(y[G_], 1); CHECK_EQ(y[B_], 2);
+}
+
 /* B8 has one channel, presented as {1,B,B,B}. A crossbar taking every output
  * from B (0xAAFF, a distance-field font atlas) must read that channel, not
  * component 2 of a one-channel resource. */
@@ -722,6 +747,8 @@ int main(void)
     test_remap_field_order_is_not_reversed();
     test_remap_force_zero_and_one();
     test_remap_g8b8_lanes();
+    test_remap_x16_alpha_from_g();
+    test_remap_single_channel_float_and_depth();
     test_remap_dxt_matches_argb();
     test_remap_rejects_null();
 

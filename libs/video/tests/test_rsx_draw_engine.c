@@ -69,6 +69,7 @@ typedef struct {
     u8  alive[STUB_MAX_OBJECTS];
 
     int n_texture_create, n_texture_release, n_texture_upload;
+    int n_texture_live, texture_live_cap;
     int n_color_create, n_color_release, n_color_seeded;
     int n_depth_create, n_depth_snapshot;
     int n_pipeline_create;
@@ -113,7 +114,9 @@ static u32 stub_texture_create(void* u, rsx_be_format f, u32 w, u32 h, u32 mips,
     (void)u; (void)f; (void)w; (void)h; (void)mips; (void)faces;
     (void)remap; (void)rsx_fmt;
     stub.n_texture_create++;
+    if (stub.texture_live_cap && stub.n_texture_live >= stub.texture_live_cap) return 0;
     stub.last_created_texture = stub_handle();
+    if (stub.last_created_texture) stub.n_texture_live++;
     return stub.last_created_texture;
 }
 
@@ -133,7 +136,11 @@ static void stub_release(void* u, u32 handle)
 }
 
 static void stub_texture_release(void* u, u32 handle)
-{ stub.n_texture_release++; stub_release(u, handle); }
+{
+    stub.n_texture_release++;
+    if (handle && handle < STUB_MAX_OBJECTS && stub.alive[handle]) stub.n_texture_live--;
+    stub_release(u, handle);
+}
 
 static u32 stub_color_create(void* u, rsx_be_format f, u32 w, u32 h,
                              const void* seed, u32 seed_row)
@@ -577,18 +584,15 @@ static void test_texture_cache(void)
           "a repeat bind in the same frame reuses it (%d uploads)",
           stub.n_texture_create);
 
-    /* The guest rewrites the image in place -- an animated UI, a video frame,
-     * a surface the 2D engine wrote. The cache must notice, and it costs one
-     * content hash per entry per frame, not one per draw. */
     rsx_draw_engine_present();
     memset(vm_base + TEX_OFFSET, 0x22, 4 * 4 * 4);
     draw_triangle();
-    CHECK(stub.n_texture_create == 2 && stub.alive[first] == 0,
-          "changed guest bytes are re-decoded and the old resource retired");
+    CHECK(stub.n_texture_create == 1 && stub.n_texture_upload == 2 && stub.alive[first] == 1,
+          "changed guest bytes are re-decoded into the same resource");
 
     rsx_draw_engine_present();
     draw_triangle();
-    CHECK(stub.n_texture_create == 2,
+    CHECK(stub.n_texture_create == 1 && stub.n_texture_upload == 2,
           "unchanged bytes in a later frame do not re-decode");
 
     /* Fill the cache past its capacity with distinct descriptors, then come
@@ -615,6 +619,28 @@ static void test_texture_cache(void)
     CHECK(stub.n_texture_create == creates + 1,
           "the least recently used entry was the one evicted");
 
+    engine_down();
+}
+
+static void test_texture_out_of_memory(void)
+{
+    printf("-- texture out of device memory\n");
+    engine_up();
+    stub.texture_live_cap = 2;
+    for (u32 i = 0; i < 3; i++) {
+        rsx_draw_engine_present();
+        bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET + 0x2000u + i * 0x100u);
+        draw_triangle();
+    }
+    CHECK(stub.bound_tex[0] != 0 && stub.n_texture_release == 1 && stub.n_texture_live == 2,
+          "a failed create evicts the least recently used texture and retries"
+          " (%d releases, %d live)", stub.n_texture_release, stub.n_texture_live);
+    const int creates = stub.n_texture_create;
+    rsx_draw_engine_present();
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET + 0x2000u);
+    draw_triangle();
+    CHECK(stub.bound_tex[0] != 0 && stub.n_texture_create > creates,
+          "the evicted texture is decoded again on its next use");
     engine_down();
 }
 
@@ -1074,6 +1100,17 @@ static void test_depth_clear_value(void)
     m(M_CLEAR_BUFFERS, 0x01u);
     CHECK(stub.last_clear_depth == 1.0f,
           "a Z24S8 zeta cleared with 0xFFFFFF00 clears to 1.0 (%g)", stub.last_clear_depth);
+
+    m(0x03B0u, 1u << 12);
+    m(M_ZSTENCIL_CLEAR, 0xBB86E600u);
+    m(M_CLEAR_BUFFERS, 0x01u);
+    CHECK(stub.last_clear_depth == 1.0f,
+          "a float Z24S8 zeta cleared past the far plane clears to 1.0 (%g)", stub.last_clear_depth);
+    m(M_ZSTENCIL_CLEAR, 0x7E000000u);
+    m(M_CLEAR_BUFFERS, 0x01u);
+    CHECK(stub.last_clear_depth == 0.5f,
+          "a float Z24S8 clear value is an f32 shifted right by 7 (%g)", stub.last_clear_depth);
+    m(0x03B0u, 0u);
     engine_down();
 }
 
@@ -1164,6 +1201,7 @@ int main(void)
     test_surface_aliasing();
     test_mrt_set();
     test_texture_cache();
+    test_texture_out_of_memory();
     test_pipeline_key();
     test_restart_expansion();
     test_indexed_draws();

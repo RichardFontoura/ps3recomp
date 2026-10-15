@@ -307,23 +307,26 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
 {
     if (!out) return;
 
-    /* Source codes index the presented vector {A,R,G,B}. The uploaded resource
-     * holds R,G,B,A at components 0..3, so A is component 3 and R,G,B are
-     * 0,1,2 -- that is what lanes_argb says. G8B8 only has two real channels,
-     * and the sampler presents them as {G,R,G,R}. B8 decodes to a one-channel
-     * resource whose byte is presented as R, G and B with an opaque A, which
-     * is what the D3D12 live engine's CPU decode builds (decode_texel); read
-     * through lanes_argb its B source would be component 2, always zero. */
     static const u8 lanes_argb[4] = {3, 0, 1, 2};
     static const u8 lanes_g8b8[4] = {1, 0, 1, 0};
     static const u8 lanes_b8[4]   = {RSX_REMAP_ONE, 0, 0, 0};
-    const u32 base = rsx_fmt & 0x9Fu;
-    const u8* src2res = (base == 0x8Bu) ? lanes_g8b8
-                      : (base == 0x81u) ? lanes_b8 : lanes_argb;
+    static const u8 lanes_x16[4]  = {0, RSX_REMAP_ONE, 0, RSX_REMAP_ONE};
+    static const u8 lanes_rrrr[4] = {0, 0, 0, 0};
+    static const u8 lanes_rgrg[4] = {0, 1, 0, 1};
+    static const u8 lanes_xrgb[4] = {RSX_REMAP_ONE, 0, 1, 2};
+    const u8* src2res;
+    switch (rsx_fmt & 0x9Fu) {
+    case 0x81u: src2res = lanes_b8; break;
+    case 0x8Bu: case 0x95u: src2res = lanes_g8b8; break;
+    case 0x94u: src2res = lanes_x16; break;
+    case 0x90u: case 0x91u: case 0x92u: case 0x93u: case 0x9Cu: src2res = lanes_rrrr; break;
+    case 0x9Fu: src2res = lanes_rgrg; break;
+    case 0x9Du: case 0x9Eu: src2res = lanes_xrgb; break;
+    default: src2res = lanes_argb; break;
+    }
 
-    if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;   /* unset -> identity */
+    if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;
 
-    /* i runs A, R, G, B -- the crossbar's field order, LSB first. */
     for (int i = 0; i < 4; i++) {
         u32 s  = (control1 >> (i * 2)) & 3u;
         u32 op = (control1 >> (8 + i * 2)) & 3u;
