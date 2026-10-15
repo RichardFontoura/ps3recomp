@@ -104,6 +104,10 @@ jobs:
             -std=gnu17 -I include -I runtime/spu \
             -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+            -std=gnu17 -I include -I runtime/spu \
+            -o /tmp/test_spu_xfloat runtime/spu/tests/test_spu_xfloat.c -lm
+          /tmp/test_spu_xfloat
 
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
@@ -330,7 +334,7 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
-            runtime/platform/win32_compat.c \
+            runtime/platform/win32_compat.c runtime/trace/ps3_timeline.c \
             -lpthread -lm
           /tmp/test_spu_lockline_peer
 
@@ -347,9 +351,62 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
-            runtime/platform/win32_compat.c \
+            runtime/platform/win32_compat.c runtime/trace/ps3_timeline.c \
             -lpthread -lm
           /tmp/test_spu_taskset_wake
+
+      - name: SPURS task created from an SPU starts
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spu_taskset_spu_create \
+            runtime/spu/tests/test_spu_taskset_spu_create.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c runtime/trace/ps3_timeline.c \
+            -lpthread -lm
+          /tmp/test_spu_taskset_spu_create
+
+      - name: GCM flip stays in FIFO order and pacing window
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I libs/video \
+            libs/video/tests/test_gcm_flip_fifo.c runtime/trace/ps3_timeline.c -pthread \
+            -ffunction-sections -fdata-sections -Wl,--gc-sections \
+            -o /tmp/test_gcm_flip_fifo
+          /tmp/test_gcm_flip_fifo
+
+      - name: NV3089 blits stay inside the guest memory regions
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I libs/video \
+            libs/video/tests/test_gcm_blit_bounds.c runtime/trace/ps3_timeline.c -pthread \
+            -ffunction-sections -fdata-sections -Wl,--gc-sections \
+            -o /tmp/test_gcm_blit_bounds
+          /tmp/test_gcm_blit_bounds
+
+      - name: Position-independent SPU code dispatch
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spu_pic_dispatch \
+            runtime/spu/tests/test_spu_pic_dispatch.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c runtime/trace/ps3_timeline.c \
+            -lpthread -lm
+          /tmp/test_spu_pic_dispatch
+          python3 tools/test_spu_pic_lift.py
+
+      - name: cellAudio port opens in a page-aligned guest arena
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include \
+            libs/audio/tests/test_audio_port_arena.c \
+            -ffunction-sections -fdata-sections -Wl,--gc-sections -lSDL2 -lpthread \
+            -o /tmp/test_audio_port_arena
+          /tmp/test_audio_port_arena
 
       # A thread group starting its threads on their image's LIFTED code. This
       # is the path a real title needs and the one that used to be missing: the
@@ -372,7 +429,7 @@ jobs:
             runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c \
             runtime/spu/spu_interp.c runtime/spu/spu_lifted_thread.c \
             runtime/syscalls/spu_fallback.c runtime/syscalls/sdk_version_weak.c \
-            runtime/platform/win32_compat.c \
+            runtime/platform/win32_compat.c runtime/trace/ps3_timeline.c \
             -lpthread -lm
           /tmp/test_spu_lifted_start
 
@@ -394,6 +451,20 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
-            runtime/platform/win32_compat.c \
+            runtime/platform/win32_compat.c runtime/trace/ps3_timeline.c \
             -lpthread -lm
           /tmp/test_spu_mfc_slots
+
+      - name: Run the SPU DMA poll test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spu_dma_poll \
+            runtime/spu/tests/test_spu_dma_poll.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c runtime/trace/ps3_timeline.c \
+            -lpthread -lm
+          /tmp/test_spu_dma_poll
