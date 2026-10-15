@@ -12,6 +12,7 @@
 
 #include <time.h>
 #include "cellPad.h"
+#include "cellPad_host.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,6 +82,14 @@ static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
+static CellPadHostRead s_host_read;
+static CellPadHostRumble s_host_rumble;
+
+void cellPad_set_host_adapter(CellPadHostRead read, CellPadHostRumble rumble)
+{
+    s_host_read = read;
+    s_host_rumble = rumble;
+}
 
 #if PAD_BACKEND_SDL2
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
@@ -434,6 +443,21 @@ static void pad_poll_backend(void)
      * every port. cellPadGetData hands each one out exactly once. */
     for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++) s_data_fresh[_i] = 1;
 
+    if (s_host_read) {
+        for (unsigned i = 0; i < PAD_MAX_HOST_PORTS; ++i) {
+            CellPadHostSample sample = {0, 0, 128, 128, 128, 128, 0, 0};
+            s_host_read(i, &sample);
+            PadHostState* hs = &s_host_state[i];
+            memset(hs, 0, sizeof(*hs));
+            hs->connected = sample.connected;
+            hs->buttons = sample.buttons;
+            hs->analog_lx = sample.lx; hs->analog_ly = sample.ly;
+            hs->analog_rx = sample.rx; hs->analog_ry = sample.ry;
+            hs->trigger_l2 = sample.l2; hs->trigger_r2 = sample.r2;
+        }
+        return;
+    }
+
 #if PAD_BACKEND_XINPUT
     pad_poll_xinput();
 #elif PAD_BACKEND_SDL2
@@ -467,7 +491,7 @@ s32 cellPadInit(u32 max_connect)
     memset(s_port_setting, 0, sizeof(s_port_setting));
     memset(s_host_state, 0, sizeof(s_host_state));
 
-    pad_init_backend();
+    if (!s_host_read) pad_init_backend();
 
     /* Do an initial poll to detect connected controllers */
     pad_poll_backend();
@@ -482,7 +506,7 @@ s32 cellPadEnd(void)
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 
-    pad_shutdown_backend();
+    if (!s_host_read) pad_shutdown_backend();
 
     s_pad_initialized = 0;
     s_max_connect = 0;
@@ -829,6 +853,18 @@ emit:
             else                        s_data_fresh[port_no] = 0;
         }
     }
+
+    /* Opt-in proof that a host input report was actually consumed by the guest. */
+    if (data->len && port_no < PAD_MAX_HOST_PORTS && getenv("PAD_REPORT_TRACE")) {
+        static u16 previous[PAD_MAX_HOST_PORTS];
+        u16 bits = data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |
+                   (data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] << 8);
+        if (bits != previous[port_no]) {
+            fprintf(stderr, "[cellPad] report port=%u buttons=0x%04x len=%d\n",
+                    port_no, bits, data->len);
+            previous[port_no] = bits;
+        }
+    }
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
@@ -1070,6 +1106,13 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
     param = GUEST_PTR(param, CellPadActParam*);
+
+    if (s_host_read) {
+        if (s_host_rumble)
+            s_host_rumble(port_no, param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL],
+                         param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE]);
+        return CELL_OK;
+    }
 
 #if PAD_BACKEND_XINPUT
     /* Map to XInput vibration */
