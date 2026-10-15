@@ -8,6 +8,7 @@
  * Actual rendering is handled elsewhere -- this module just tracks state.
  */
 
+#include "../../runtime/ps3_log.h"
 #include "../../runtime/trace/ps3_timeline.h"
 #include "rsx_live_draw.h"
 #include "rsx_draw_engine.h"
@@ -3098,7 +3099,7 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
     if (index >= CELL_GCM_MAX_TILE_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] SetTile(index=%u, loc=%u, offset=0x%X, size=0x%X, pitch=%u)\n",
+    if (ps3_trace(PS3_TRACE_GCM)) printf("[cellGcmSys] SetTile(index=%u, loc=%u, offset=0x%X, size=0x%X, pitch=%u)\n",
            index, location, offset, size, pitch);
 
     s_tiles[index].offset = offset;
@@ -3150,7 +3151,7 @@ s32 cellGcmBindTile(u8 index)
     if (index >= CELL_GCM_MAX_TILE_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] BindTile(index=%u)\n", index);
+    if (ps3_trace(PS3_TRACE_GCM)) printf("[cellGcmSys] BindTile(index=%u)\n", index);
     s_tiles[index].bound = 1;
     return CELL_OK;
 }
@@ -3172,7 +3173,7 @@ s32 cellGcmUnbindTile(u8 index)
     if (index >= CELL_GCM_MAX_TILE_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] UnbindTile(index=%u)\n", index);
+    if (ps3_trace(PS3_TRACE_GCM)) printf("[cellGcmSys] UnbindTile(index=%u)\n", index);
     s_tiles[index].bound = 0;
     return CELL_OK;
 }

@@ -294,7 +294,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     /* PPU_THREADGATE: the creating thread is now blocking -> workers may run
      * (PS3 priority semantics). Their job objects are fully initialized by now. */
     { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
-    if (ps3_log_verbose())
+    if (ps3_trace(PS3_TRACE_WAIT))
         fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu) tid=%llu cia=0x%08X lr=0x%08X\n",
                 queue_id, (unsigned long long)timeout_us,
                 (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
@@ -925,7 +925,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
     if (s_send_stack) { static unsigned char seen[8]={0}; unsigned pk=port_id&7;
         if(!seen[pk]){ seen[pk]=1; extern void ppu_dump_guest_stack(ppu_context*,const char*);
             char tag[40]; snprintf(tag,sizeof tag,"port_send producer port=%u",port_id); ppu_dump_guest_stack(ctx,tag); } }
-    if (ps3_log_verbose()) fprintf(stderr, "[evt] port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
+    if (ps3_trace(PS3_TRACE_EVT)) fprintf(stderr, "[evt] port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
             port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3);
 
     if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
@@ -958,7 +958,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
         fprintf(stderr, "[evt] port_send(port=%u): NOT CONNECTED to any queue\n", port_id);
         return (int64_t)(int32_t)CELL_ENOTCONN;
     }
-    if (ps3_log_verbose()) fprintf(stderr, "[evt] port_send(port=%u) -> queue id=%d (source=0x%llX)\n",
+    if (ps3_trace(PS3_TRACE_EVT)) fprintf(stderr, "[evt] port_send(port=%u) -> queue id=%d (source=0x%llX)\n",
             port_id, p->connected_queue, (unsigned long long)p->name);
 
     int32_t qidx = p->connected_queue;

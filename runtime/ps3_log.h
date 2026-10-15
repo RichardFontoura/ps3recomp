@@ -11,6 +11,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #ifdef _WIN32
 #include <io.h>
 #define PS3_ISATTY_STDERR() _isatty(_fileno(stderr))
@@ -18,6 +19,12 @@
 #include <unistd.h>
 #define PS3_ISATTY_STDERR() isatty(fileno(stderr))
 #endif
+
+#define PS3_TRACE_WAIT  0x1u
+#define PS3_TRACE_EVT   0x2u
+#define PS3_TRACE_SPURS 0x4u
+#define PS3_TRACE_GCM   0x8u
+#define PS3_TRACE_ALL   0xFu
 
 #ifdef __cplusplus
 static inline int ps3_log_verbose(void)
@@ -43,6 +50,44 @@ static __inline int ps3_log_verbose(void)
         else   v = !PS3_ISATTY_STDERR();
     }
     return v;
+}
+
+#ifdef __cplusplus
+static inline unsigned ps3_trace_parse(const char* list)
+#else
+static __inline unsigned ps3_trace_parse(const char* list)
+#endif
+{
+    static const struct { const char* name; unsigned bit; } cats[] = {
+        { "wait", PS3_TRACE_WAIT }, { "evt", PS3_TRACE_EVT },
+        { "spurs", PS3_TRACE_SPURS }, { "gcm", PS3_TRACE_GCM }, { "all", PS3_TRACE_ALL },
+    };
+    unsigned mask = 0;
+    while (*list) {
+        size_t len = strcspn(list, ",");
+        for (size_t i = 0; i < sizeof cats / sizeof cats[0]; i++)
+            if (strlen(cats[i].name) == len && strncmp(list, cats[i].name, len) == 0)
+                mask |= cats[i].bit;
+        list += len;
+        if (*list) list++;
+    }
+    return mask;
+}
+
+#ifdef __cplusplus
+static inline int ps3_trace(unsigned category)
+#else
+static __inline int ps3_trace(unsigned category)
+#endif
+{
+    static int mask = -1;
+    if (mask < 0) {
+        const char* list = getenv("PS3RECOMP_TRACE");
+        const char* verbose = getenv("PS3_VERBOSE");
+        if (list) mask = (int)ps3_trace_parse(list);
+        else mask = (verbose && verbose[0] && verbose[0] != '0') ? (int)PS3_TRACE_ALL : 0;
+    }
+    return (mask & (int)category) != 0;
 }
 
 #endif /* PS3_LOG_H */
