@@ -2,6 +2,7 @@
  * ps3recomp - Timer and time syscalls (implementation)
  */
 
+#include "../trace/ps3_timeline.h"
 #include "sys_timer.h"
 #include "sys_event.h"
 #include "../memory/vm.h"
@@ -249,7 +250,9 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         struct timespec ts;
         ts.tv_sec  = (time_t)(usec / 1000000);
         ts.tv_nsec = (long)((usec % 1000000) * 1000);
+        ps3_timeline(PS3_TL_USLEEP_BEGIN, (uint32_t)usec);
         nanosleep(&ts, NULL);
+        ps3_timeline(PS3_TL_USLEEP_END, (uint32_t)ctx->lr);
     }
 #endif
 
