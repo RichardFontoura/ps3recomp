@@ -26,6 +26,7 @@
 #define SPU_COHERENCY_H
 
 #include "spu_context.h"
+#include "spu_line_trace.h"
 
 #include <stdint.h>
 

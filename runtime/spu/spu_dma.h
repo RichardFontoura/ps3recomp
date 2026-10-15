@@ -15,6 +15,7 @@
 #ifndef SPU_DMA_H
 #define SPU_DMA_H
 
+#include "spu_line_trace.h"
 #include "spu_context.h"
 #include <stdint.h>
 #include <string.h>
@@ -675,6 +676,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             if (span_reserved) {
                 spu_lockline_lock();
                 memcpy(ea_ptr, ls_ptr, size);
+                if (SPU_LINE_TRACE_HIT(ea, size))
+                    spu_line_trace_note(SPU_LINE_TRACE_PUT, (uint32_t)ea, size, spu,
+                                        (uint32_t)spu->pc & SPU_LS_MASK,
+                                        spu->gpr[0]._u32[0] & SPU_LS_MASK, SPU_LINE_TRACE_SPUNUM(spu));
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
                     if (a == a1) break;
@@ -682,6 +687,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 spu_lockline_unlock();
             } else {
                 memcpy(ea_ptr, ls_ptr, size);
+                if (SPU_LINE_TRACE_HIT(ea, size))
+                    spu_line_trace_note(SPU_LINE_TRACE_PUT, (uint32_t)ea, size, spu,
+                                        (uint32_t)spu->pc & SPU_LS_MASK,
+                                        spu->gpr[0]._u32[0] & SPU_LS_MASK, SPU_LINE_TRACE_SPUNUM(spu));
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) {
                         spu_lockline_lock();

@@ -577,6 +577,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
         ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 4;
         ctx->dbg_getllar++;
+        if (SPU_LINE_TRACE_HIT(ea, MFC_ATOMIC_LINE))
+            spu_line_trace_note(SPU_LINE_TRACE_GETLLAR, ea, MFC_ATOMIC_LINE, ctx,
+                                (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                                SPU_LINE_TRACE_SPUNUM(ctx));
         /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
          * that nobody is releasing (a ticket lock, a counter barrier). Say so
          * once per line with the line's head, so the stuck word is visible
@@ -742,6 +746,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               fprintf(stderr, "[atom-ea] PUTLLC %s lr=0x%05X ea=0x%08X\n",
                       ctx->atomic_stat ? "FAIL" : "OK",
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
+        if (SPU_LINE_TRACE_HIT(ea, MFC_ATOMIC_LINE))
+            spu_line_trace_note(ctx->atomic_stat ? SPU_LINE_TRACE_PUTLLC_FAIL : SPU_LINE_TRACE_PUTLLC_OK,
+                                ea, MFC_ATOMIC_LINE, ctx, (uint32_t)ctx->pc & SPU_LS_MASK,
+                                ctx->gpr[0]._u32[0] & SPU_LS_MASK, SPU_LINE_TRACE_SPUNUM(ctx));
         ctx->resv_valid = 0;                           /* reservation consumed */
         spu_lockline_unlock();
         if (ctx->atomic_stat == 0) {

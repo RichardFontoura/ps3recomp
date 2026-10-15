@@ -15,6 +15,12 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include <time.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -87,8 +93,15 @@ static int          s_coh_n;
 
 unsigned long g_spu_lr_raise = 0;
 
+uint32_t g_spu_line_trace_ea;
+spu_line_trace_entry g_spu_line_trace[4096];
+volatile uint32_t g_spu_line_trace_seq;
+uint32_t g_spu_line_trace_n;
+uint32_t g_spu_line_trace_eas[32];
+
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
+    { static int inited; if (!inited) { inited = 1; spu_line_trace_init(); } }
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
     s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
     s_coh_armed = 1;
@@ -216,6 +229,66 @@ void spu_coh_notify_write(uint32_t ea)
             spu_ch_wake(c);
         }
     }
+}
+
+void spu_line_trace_init(void)
+{
+    const char* e = getenv("SPU_LINE_TRACE");
+    g_spu_line_trace_n = 0;
+    while (e && *e && g_spu_line_trace_n < 32u) {
+        char* end;
+        const uint32_t v = (uint32_t)strtoul(e, &end, 16) & ~127u;
+        if (end == e) break;
+        g_spu_line_trace_eas[g_spu_line_trace_n++] = v;
+        e = *end == ',' ? end + 1 : end;
+    }
+    g_spu_line_trace_ea = g_spu_line_trace_n ? g_spu_line_trace_eas[0] : 0u;
+}
+
+static int spu_line_trace_index(uint32_t ea, uint32_t size)
+{
+    for (uint32_t i = 0; i < g_spu_line_trace_n; i++) {
+        const uint32_t l = g_spu_line_trace_eas[i];
+        if (ea < l + 128u && ea + size > l) return (int)i;
+    }
+    return -1;
+}
+
+int spu_line_trace_hit(uint32_t ea, uint32_t size)
+{
+    return spu_line_trace_index(ea, size) >= 0;
+}
+
+void spu_line_trace_note(uint32_t kind, uint32_t ea, uint32_t size, const void* actor,
+                         uint32_t pc, uint32_t lr, uint32_t spu_num)
+{
+    extern uint8_t* vm_base;
+    static uint8_t last[32][128];
+    static uint8_t have_last[32];
+    const int li = spu_line_trace_index(ea, size);
+    if (li < 0) return;
+    const uint32_t line_ea = g_spu_line_trace_eas[li];
+    const uint8_t* now = vm_base + line_ea;
+    if (kind != SPU_LINE_TRACE_PUTLLC_FAIL && have_last[li] &&
+        !memcmp(now, last[li], 0x40) && !memcmp(now + 0x50, last[li] + 0x50, 0x30))
+        return;
+    memcpy(last[li], now, 128);
+    have_last[li] = 1;
+    const uint32_t seq = __atomic_fetch_add(&g_spu_line_trace_seq, 1u, __ATOMIC_RELAXED);
+    spu_line_trace_entry* t = &g_spu_line_trace[seq % 4096u];
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    t->ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    t->seq = seq; t->kind = kind; t->ea = ea; t->size = size;
+    t->pc = pc; t->lr = lr; t->spu_num = spu_num;
+#if defined(_WIN32)
+    t->tid = (uint32_t)GetCurrentThreadId();
+#else
+    t->tid = (uint32_t)syscall(SYS_gettid);
+#endif
+    t->actor = actor;
+    t->line_ea = line_ea;
+    memcpy(t->line, now, 128);
 }
 
 #ifdef __cplusplus

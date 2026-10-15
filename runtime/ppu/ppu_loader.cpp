@@ -33,6 +33,7 @@
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #include "ppu_recomp.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
+#include "../spu/spu_line_trace.h"
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
@@ -952,6 +953,9 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
+        if (ok && SPU_LINE_TRACE_HIT(ea, 4))
+            spu_line_trace_note(SPU_LINE_TRACE_PPU_CAS, (uint32_t)ea, 4, self, val,
+                                self ? (uint32_t)self->lr : 0u, 0xFFFFu);
         if (ok) spu_coh_notify_write((uint32_t)ea);
         spu_lockline_unlock();
     }
@@ -1441,6 +1445,10 @@ static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
         if (spu_coh_is_reserved((uint32_t)(a))) {                             \
             spu_lockline_lock();                                              \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
+            if (SPU_LINE_TRACE_HIT((a), (n)))                                 \
+                spu_line_trace_note(SPU_LINE_TRACE_PPU_STORE, (uint32_t)(a),  \
+                    (uint32_t)(n), g_active_ctx, 0,                           \
+                    g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u, 0xFFFFu); \
             spu_coh_notify_write((uint32_t)(a));                              \
             spu_lockline_unlock();                                            \
         } else {                                                              \
