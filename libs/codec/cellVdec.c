@@ -22,6 +22,7 @@
 #include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
 #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
 #include "../../runtime/memory/vm.h"     /* VM_HLE_INJECT_BASE */
+#include "../../runtime/trace/ps3_timeline.h"
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -30,6 +31,7 @@
 #define VDEC_QUEUE   32   /* decoded pictures waiting for GetPicture */
 #define VDEC_BUSY_AT 16   /* refuse new AUs past this many (EndSeq can add more) */
 #define VDEC_AU_RING 64   /* AUs remembered for pictures that come out late */
+#define VDEC_SHOWN_RING 256
 
 /* A decoded picture waiting for the title (decoder path only). */
 typedef struct {
@@ -74,6 +76,9 @@ static const struct { u32 code; u32 num; u32 den; } k_vdec_rates[] = {
 };
 
 static VdecSlot s_vdec[MAX_VDEC];
+static u64 s_vdec_shown_ns[VDEC_SHOWN_RING];
+static u32 s_vdec_shown_total;
+static u64 s_vdec_last_shown_ns;
 
 static u64 vdec_perf_us(void)
 {
@@ -91,6 +96,45 @@ static u64 vdec_perf_us(void)
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (u64)t.tv_sec * 1000000ull + (u64)t.tv_nsec / 1000ull;
 #endif
+}
+
+u64 ps3recomp_vdec_now_ns(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER t, f;
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&f);
+    return (u64)(t.QuadPart / f.QuadPart) * 1000000000ull +
+           (u64)(t.QuadPart % f.QuadPart) * 1000000000ull / f.QuadPart;
+#else
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (u64)t.tv_sec * 1000000000ull + (u64)t.tv_nsec;
+#endif
+}
+
+u32 ps3recomp_vdec_pictures_in_last_second(u64 now_ns)
+{
+    u32 count = 0;
+    for (u32 i = 0; i < VDEC_SHOWN_RING; i++) {
+        const u64 t = __atomic_load_n(&s_vdec_shown_ns[i], __ATOMIC_RELAXED);
+        if (t && t + 1000000000ull > now_ns) count++;
+    }
+    return count;
+}
+
+u64 ps3recomp_vdec_last_picture_ns(void)
+{
+    return __atomic_load_n(&s_vdec_last_shown_ns, __ATOMIC_RELAXED);
+}
+
+static void vdec_note_shown(u64 pts)
+{
+    const u64 now = ps3recomp_vdec_now_ns();
+    const u32 n = __atomic_fetch_add(&s_vdec_shown_total, 1u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_vdec_shown_ns[n % VDEC_SHOWN_RING], now, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_vdec_last_shown_ns, now, __ATOMIC_RELAXED);
+    ps3_timeline(PS3_TL_VDEC_PICTURE, (u32)pts);
 }
 
 /* Deliver a vdec message to the guest callback (handle, msgType, msgData,
@@ -352,6 +396,7 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
         if (au.size)   /* an empty packet would mean end of stream to FFmpeg */
             vdec_ff_decode(v->ff, vm_ptr8(au.startAddr), au.size, v->auCount,
                            vdec_on_picture, v);
+        ps3_timeline(PS3_TL_VDEC_DECODE, v->auCount);
         if (begin) {
             const u64 end = vdec_perf_us();
             fprintf(stderr, "[vdec-perf] decode host_us=%llu duration_us=%llu au=%u queued=%u pictures=%u\n",
@@ -503,9 +548,11 @@ static s32 vdec_take_picture(VdecSlot* v, u32 dst, u32 type, u32 matrix, u8 alph
     v->qHead = (v->qHead + 1) % VDEC_QUEUE;
     v->qCount--;
     const u64 begin = vdec_perf_us();
-    if (dst)                                           /* NULL: a skip */
+    if (dst) {
         vdec_store_picture(dst, q->yuv, q->item.width, q->item.height,
                            type, matrix, alpha);
+        vdec_note_shown(q->item.pts);
+    }
     if (begin) {
         const u64 end = vdec_perf_us();
         fprintf(stderr, "[vdec-perf] picture host_us=%llu duration_us=%llu pts=%llu frc=%u size=%ux%u format=%u skip=%u queued=%u\n",
@@ -531,7 +578,8 @@ s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff)
         return (s32)CELL_VDEC_ERROR_EMPTY;
     v->hasPic = 0;
     if (!dst)
-        return CELL_OK;                                /* a skip: consume only */
+        return CELL_OK;
+    vdec_note_shown(v->lastPic.pts);
 
     u32 type  = vm_read32(fmt_ea + 0);
     u8  alpha = vm_read8(fmt_ea + 8);

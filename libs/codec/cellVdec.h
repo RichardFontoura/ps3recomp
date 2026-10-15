@@ -128,6 +128,10 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem);
 
 s32 cellVdecSetFrameRate(CellVdecHandle handle, u32 frameRateCode);
 
+u64 ps3recomp_vdec_now_ns(void);
+u32 ps3recomp_vdec_pictures_in_last_second(u64 now_ns);
+u64 ps3recomp_vdec_last_picture_ns(void);
+
 #ifdef __cplusplus
 }
 #endif

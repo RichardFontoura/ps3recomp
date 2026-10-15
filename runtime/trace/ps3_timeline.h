@@ -22,7 +22,9 @@ enum {
     PS3_TL_GPU_FLUSH_BEGIN,
     PS3_TL_GPU_FLUSH_END,
     PS3_TL_FLIP_WORD,
-    PS3_TL_REPORT
+    PS3_TL_REPORT,
+    PS3_TL_VDEC_DECODE,
+    PS3_TL_VDEC_PICTURE
 };
 
 extern volatile int g_ps3_timeline_on;

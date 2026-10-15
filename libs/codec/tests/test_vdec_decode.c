@@ -30,7 +30,6 @@
 #include <math.h>
 #include <stdlib.h>
 
-/* What the runtime would provide. */
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 uint32_t ppu_hle_inject_base = 0x01000000u;
@@ -42,6 +41,9 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+volatile int g_ps3_timeline_on = 1;
+static u32 s_tl_pictures;
+void ps3_timeline_event(uint32_t type, uint32_t arg) { (void)arg; s_tl_pictures += type == PS3_TL_VDEC_PICTURE; }
 
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); exit(1); } } while (0)
 
@@ -261,6 +263,8 @@ static int mode_stub(int argc, char** argv)
 
     u32 h = open_decoder(codec);
     CHECK(s_vdec[h].ff == NULL);
+    const u64 t0 = ps3recomp_vdec_now_ns();
+    CHECK(ps3recomp_vdec_pictures_in_last_second(t0) == 0 && ps3recomp_vdec_last_picture_ns() == 0);
     s_nmsg = 0;
     CHECK(cellVdecStartSeq(h) == CELL_OK);
     for (int i = 0; i < 3 && i < s_nau; i++) {
@@ -302,7 +306,17 @@ static int mode_stub(int argc, char** argv)
         CHECK(vm_base[G_PIC + 1280 * 720 * 3 / 2] == 0x55);
         CHECK(cellVdecGetPicture(h, (const void*)(uintptr_t)G_FMT, (void*)(uintptr_t)G_PIC)
               == (s32)CELL_VDEC_ERROR_EMPTY);
+        CHECK(ps3recomp_vdec_pictures_in_last_second(ps3recomp_vdec_now_ns()) == (u32)i + 1);
     }
+    const u32 shown = s_nau < 3 ? (u32)s_nau : 3;
+    if (s_nau > 3) {
+        CHECK(submit(h, es, 3) == CELL_OK);
+        CHECK(cellVdecGetPicture(h, (const void*)(uintptr_t)G_FMT, NULL) == CELL_OK);
+    }
+    const u64 t1 = ps3recomp_vdec_now_ns();
+    CHECK(ps3recomp_vdec_pictures_in_last_second(t1) == shown && s_tl_pictures == shown);
+    CHECK(ps3recomp_vdec_last_picture_ns() >= t0 && ps3recomp_vdec_last_picture_ns() <= t1);
+    CHECK(ps3recomp_vdec_pictures_in_last_second(t1 + 1000000000ull) == 0);
     int m0 = s_nmsg;
     CHECK(cellVdecEndSeq(h) == CELL_OK);
     CHECK(s_nmsg == m0 + 1 && s_msgs[m0] == CELL_VDEC_MSG_TYPE_SEQDONE);
@@ -338,8 +352,11 @@ static int mode_decode(int argc, char** argv)
     }
     printf("%s: %d AUs, %d reference frames %ux%u\n", argv[2], s_nau, nref, W, H);
 
-    for (int pass = 0; pass < 2; pass++) {       /* the second after a seq reset */
+    for (int pass = 0; pass < 2; pass++) {
+        const u32 shown_before = s_tl_pictures;
         run_sequence(h, codec, es, -1, 3);
+        CHECK(s_tl_pictures - shown_before == (u32)s_npic);
+        if (pass == 0) CHECK(ps3recomp_vdec_pictures_in_last_second(ps3recomp_vdec_now_ns()) == (u32)s_npic);
         int bad = count_mismatches(ref, nref);
         printf("pass %d: %d pictures, %d differ from ffmpeg's decode\n", pass, s_npic, bad);
         CHECK(bad == 0);
