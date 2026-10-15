@@ -8,6 +8,7 @@
  * (the PPU create path) and the PM dispatcher call these.
  */
 #include "spurs_taskset.h"
+#include "spu_workload.h"
 #include <stdint.h>
 
 /* Initialize a fresh taskset: clear all task bitsets and write the header fields.
@@ -42,8 +43,8 @@ void spurs_taskset_add_task(uint32_t taskset_ea, uint32_t taskId, uint64_t elf_e
     vm_write64(ti + TI_CONTEXT, context);
     for (int i = 0; i < 4; i++)
         vm_write32(ti + TI_LS_PATTERN + i * 4, ls_pattern ? ls_pattern[i] : 0);
-    spurs_bitset_set(taskset_ea + CSTS_ENABLED, taskId);
-    spurs_bitset_set(taskset_ea + CSTS_READY,   taskId);
+    spu_taskset_bit_update(taskset_ea + CSTS_ENABLED, taskId, 1);
+    spu_taskset_bit_update(taskset_ea + CSTS_READY,   taskId, 1);
 }
 
 /* Set the taskset's on-task-exit handler EA (CellSpursTaskset.x78). */

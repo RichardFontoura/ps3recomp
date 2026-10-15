@@ -60,6 +60,7 @@ enum {
     CSTS_EVENT_FLAG_ID1 = 0x1898, /* be u32 */
     CSTS_EVENT_FLAG_ID2 = 0x189C, /* be u32 */
     CSTS_STRUCT_END     = 0x1900,
+    CSTS2_STRUCT_SIZE   = 0x2900,
 };
 
 /* CellSpursTaskset::TaskInfo (48 bytes), at CSTS_TASKINFO + taskId*48 */

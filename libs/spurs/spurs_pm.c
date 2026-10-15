@@ -90,6 +90,7 @@ uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t taskset_ea, uint32_t taskI
         LS_BE64(0x1C0, (uint64_t)spurs_lo);
         LS_BE32(0x1C8, spuNum);
         LS_BE32(0x1CC, dmaTagId);
+        LS_BE32(0x1DC, vm_read32(taskset_ea + CSTS_WID));
         /* The task library's fast-path check FSMs on the halfword at 0x1E8
          * (ceqh of rotqbyi(LS[0x1E0],6), select-mask bit -> word0); stamp the
          * neighboring slots too -- they are all inside the moduleId/pad area
