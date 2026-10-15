@@ -33,7 +33,12 @@ extern "C" {
 #endif
 
 /* True if the file at host_path starts with the NPD magic. Cheap: one 4-byte read. */
+#define EDAT_KLIC_NOT_NPD   (-1)
+#define EDAT_KLIC_MISMATCH  (-2)
+
 int edat_is_npd(const char* host_path);
+
+int edat_install_klicensee(const char* host_path, const uint8_t klic[16]);
 
 /* Decrypt in_path -> out_path. 0 on success, negative on failure (reason logged). */
 int edat_decrypt_file(const char* in_path, const char* out_path);

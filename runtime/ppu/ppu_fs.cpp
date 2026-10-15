@@ -102,6 +102,13 @@ static void host_path(char* out, size_t cap, const char* guest)
         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
         return;
     }
+    static const char* hdd1_root = nullptr; static int hdd1_init = 0;
+    if (!hdd1_init) { hdd1_root = getenv("PS3_HDD1_ROOT"); hdd1_init = 1; }
+    if (hdd1_root && *hdd1_root && strncmp(guest, "/dev_hdd1/", 10) == 0) {
+        snprintf(out, cap, "%s/%s", hdd1_root, guest + 10);
+        for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+        return;
+    }
 
     /* /dev_flash is FIRMWARE, not game data — mapping it into the game root (the
      * old behaviour) makes every firmware lookup miss. YDKJ's FMOD asks for

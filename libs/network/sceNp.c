@@ -12,6 +12,8 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 #include "np_psnr.h"
 #include "../system/cellSysutil.h"
+#include "../filesystem/edat.h"
+#include "../../runtime/syscalls/sys_fs.h"
 
 
 /* ---------------------------------------------------------------------------
@@ -307,4 +309,63 @@ s32 sceNpScoreTerm(void)
         return SCE_NP_ERROR_NOT_INITIALIZED;
     s_score_initialized = 0;
     return CELL_OK;
+}
+
+static s32 np_drm_is_available(const char* tag, const u8* k_licensee, const char* drm_path)
+{
+    uint32_t klic_ea = (uint32_t)(uintptr_t)k_licensee;
+    uint32_t path_ea = (uint32_t)(uintptr_t)drm_path;
+    if (!path_ea)
+        return (s32)SCE_NP_DRM_ERROR_INVALID_PARAM;
+
+    char guest_path[0x101];
+    size_t len = 0;
+    while (len < sizeof guest_path - 1 && vm_base[path_ea + len]) {
+        guest_path[len] = (char)vm_base[path_ea + len];
+        len++;
+    }
+    guest_path[len] = '\0';
+
+    uint8_t klic[16] = {0};
+    if (klic_ea)
+        memcpy(klic, vm_base + klic_ea, sizeof klic);
+
+    char host_path[1024];
+    sys_fs_translate_path(guest_path, host_path, (int)sizeof host_path);
+
+    FILE* f = fopen(host_path, "rb");
+    if (!f) {
+        printf("[sceNp] %s('%s'): not found\n", tag, guest_path);
+        return (s32)CELL_ENOENT;
+    }
+    uint8_t magic[4] = {0};
+    size_t got = fread(magic, 1, sizeof magic, f);
+    fclose(f);
+
+    if (got != sizeof magic || memcmp(magic, "NPD", 4) != 0) {
+        printf("[sceNp] %s('%s'): not an NPD file, nothing to install\n", tag, guest_path);
+        return CELL_OK;
+    }
+
+    int rc = edat_install_klicensee(host_path, klic);
+    if (rc == EDAT_KLIC_MISMATCH) {
+        printf("[sceNp] %s('%s'): klicensee does not verify\n", tag, guest_path);
+        return (s32)SCE_NP_DRM_ERROR_NO_ENTITLEMENT;
+    }
+    if (rc < 0 || (rc & 3) != 3) {
+        printf("[sceNp] %s('%s'): license type %d needs a RAP\n", tag, guest_path, rc);
+        return (s32)SCE_NP_DRM_ERROR_LICENSE_NOT_FOUND;
+    }
+    printf("[sceNp] %s('%s'): klicensee installed\n", tag, guest_path);
+    return CELL_OK;
+}
+
+s32 sceNpDrmIsAvailable(const u8* k_licensee, const char* drm_path)
+{
+    return np_drm_is_available("DrmIsAvailable", k_licensee, drm_path);
+}
+
+s32 sceNpDrmIsAvailable2(const u8* k_licensee, const char* drm_path)
+{
+    return np_drm_is_available("DrmIsAvailable2", k_licensee, drm_path);
 }

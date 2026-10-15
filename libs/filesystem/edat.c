@@ -321,6 +321,11 @@ static const struct { const char* name; uint8_t key[16]; } KLIC_CANDIDATES[] = {
 
 static const uint8_t NP_OMAC_KEY_2[16] = {
     0x6B,0xA5,0x29,0x76,0xEF,0xDA,0x16,0xEF,0x3C,0x33,0x9F,0xB2,0x97,0x1E,0x25,0x6B };
+
+#define EDAT_MAX_INSTALLED_KLIC 16
+
+static uint8_t s_installed_klic[EDAT_MAX_INSTALLED_KLIC][16];
+static int     s_installed_klic_n = 0;
 static const uint8_t SDAT_KEY[16] = {
     0x0D,0x65,0x5E,0xF8,0xE6,0x74,0xA9,0x8A,0xB8,0x50,0x5C,0xFA,0x7D,0x01,0x29,0x33 };
 
@@ -385,6 +390,37 @@ int edat_selftest(void)
 /* ---------------------------------------------------------------------------
  * EDAT
  * -----------------------------------------------------------------------*/
+static int edat_klic_verifies(const uint8_t* hdr, const uint8_t klic[16])
+{
+    uint8_t ck[16], mac[16];
+    for (int i = 0; i < 16; i++) ck[i] = (uint8_t)(klic[i] ^ NP_OMAC_KEY_2[i]);
+    aes128_cmac(ck, hdr, 0x60, mac);
+    return memcmp(mac, hdr + 0x60, 16) == 0;
+}
+
+int edat_install_klicensee(const char* host_path, const uint8_t klic[16])
+{
+    FILE* f = fopen(host_path, "rb");
+    if (!f) return EDAT_KLIC_NOT_NPD;
+    uint8_t hdr[0x100];
+    size_t n = fread(hdr, 1, sizeof hdr, f);
+    fclose(f);
+    if (n != sizeof hdr || memcmp(hdr, "NPD", 4) != 0) return EDAT_KLIC_NOT_NPD;
+    if (!edat_klic_verifies(hdr, klic)) return EDAT_KLIC_MISMATCH;
+
+    uint32_t license = be32(hdr + 0x08);
+    if ((license & 3) != 3) return (int)license;
+
+    for (int i = 0; i < s_installed_klic_n; i++)
+        if (memcmp(s_installed_klic[i], klic, 16) == 0) return (int)license;
+    if (s_installed_klic_n < EDAT_MAX_INSTALLED_KLIC) {
+        memcpy(s_installed_klic[s_installed_klic_n++], klic, 16);
+        fprintf(stderr, "[edat] klicensee installed for %s (content %.48s)\n",
+                host_path, (const char*)hdr + 0x10);
+    }
+    return (int)license;
+}
+
 int edat_is_npd(const char* host_path)
 {
     FILE* f = fopen(host_path, "rb");
@@ -488,23 +524,29 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
         fprintf(stderr, "[edat] SDAT: key derived from dev_hash\n");
         have_key = 1;
     } else {
-        int found = -1;
+        const uint8_t* found_key = NULL;
+        const char* found_name = NULL;
         for (int c = 0; c < (int)(sizeof KLIC_CANDIDATES / sizeof KLIC_CANDIDATES[0]); c++) {
-            uint8_t ck[16], mac[16];
-            for (int i = 0; i < 16; i++)
-                ck[i] = (uint8_t)(KLIC_CANDIDATES[c].key[i] ^ NP_OMAC_KEY_2[i]);
-            aes128_cmac(ck, hdr, 0x60, mac);
-            if (memcmp(mac, dev_hash, 16) == 0) { found = c; break; }
+            if (edat_klic_verifies(hdr, KLIC_CANDIDATES[c].key)) {
+                found_key = KLIC_CANDIDATES[c].key;
+                found_name = KLIC_CANDIDATES[c].name;
+                break;
+            }
         }
-        if (found >= 0 && (license & 3) == 3) {
-            memcpy(key, KLIC_CANDIDATES[found].key, 16);
+        for (int c = 0; !found_key && c < s_installed_klic_n; c++) {
+            if (edat_klic_verifies(hdr, s_installed_klic[c])) {
+                found_key = s_installed_klic[c];
+                found_name = "from sceNpDrmIsAvailable";
+            }
+        }
+        if (found_key && (license & 3) == 3) {
+            memcpy(key, found_key, 16);
             have_key = 1;
-            fprintf(stderr, "[edat] klicensee %s verified against dev_hash\n",
-                    KLIC_CANDIDATES[found].name);
+            fprintf(stderr, "[edat] klicensee %s verified against dev_hash\n", found_name);
         } else if (edat_rif_key(in_path, key)) {
             have_key = 1;
             fprintf(stderr, "[edat] license type %u: using the supplied RIF key%s\n",
-                    license, found >= 0 ? "" : " (dev_hash names an unknown klicensee)");
+                    license, found_key ? "" : " (dev_hash names an unknown klicensee)");
         }
         if (!have_key) {
             fprintf(stderr,

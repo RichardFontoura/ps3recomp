@@ -30,6 +30,10 @@ extern "C" {
 #define SCE_NP_ERROR_OFFLINE                    0x8002aa0c
 #define SCE_NP_ERROR_INTERNAL                   0x8002aaff
 
+#define SCE_NP_DRM_ERROR_INVALID_PARAM          0x80029502
+#define SCE_NP_DRM_ERROR_NO_ENTITLEMENT         0x80029513
+#define SCE_NP_DRM_ERROR_LICENSE_NOT_FOUND      0x80029521
+
 /* ---------------------------------------------------------------------------
  * Constants
  * -----------------------------------------------------------------------*/
@@ -132,6 +136,9 @@ s32 sceNpManagerGetNpId(SceNpId* npId);
 s32 sceNpManagerGetOnlineId(SceNpOnlineId* onlineId);
 s32 sceNpManagerGetOnlineName(SceNpOnlineName* onlineName);
 s32 sceNpManagerGetAccountAge(s32* age);
+
+s32 sceNpDrmIsAvailable(const u8* k_licensee, const char* drm_path);
+s32 sceNpDrmIsAvailable2(const u8* k_licensee, const char* drm_path);
 
 /* Set the fake PSN username (call before sceNpInit if desired) */
 void sceNpSetFakeUsername(const char* username);
