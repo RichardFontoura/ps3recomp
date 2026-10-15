@@ -32,6 +32,7 @@ typedef struct {
     CellVdecPicItem item;
     int pictType;       /* 1 I, 2 P, 3 B, 0 unknown */
     int key;
+    u32 frc;
 } VdecPic;
 
 typedef struct {
@@ -52,9 +53,23 @@ typedef struct {
     u32 qHead, qCount;
     CellVdecAuInfo aus[VDEC_AU_RING];   /* by auCount % VDEC_AU_RING */
     u32 newPics;        /* pictures queued by the current decode call */
+    u64 nextPts;
+    u64 nextDts;
 } VdecSlot;
 
+static const struct { u32 code; u32 num; u32 den; } k_vdec_rates[] = {
+    { CELL_VDEC_FRC_24000DIV1001, 24000, 1001 },
+    { CELL_VDEC_FRC_24,           24,    1 },
+    { CELL_VDEC_FRC_25,           25,    1 },
+    { CELL_VDEC_FRC_30000DIV1001, 30000, 1001 },
+    { CELL_VDEC_FRC_30,           30,    1 },
+    { CELL_VDEC_FRC_50,           50,    1 },
+    { CELL_VDEC_FRC_60000DIV1001, 60000, 1001 },
+    { CELL_VDEC_FRC_60,           60,    1 },
+};
+
 static VdecSlot s_vdec[MAX_VDEC];
+
 
 /* Deliver a vdec message to the guest callback (handle, msgType, msgData,
  * cbArg). It is a guest OPD, so it goes through g_ps3_guest_caller; this used
@@ -85,6 +100,26 @@ static void vdec_queue_clear(VdecSlot* v)
 /* vdec_ff_emit_fn: queue a decoded picture under the item of the AU it was
  * decoded from. Pictures leave the decoder in display order, so with B-frames
  * that is not the AU just submitted; the token is that AU's auCount. */
+static u32 vdec_frame_rate_code(u32 num, u32 den)
+{
+    if (!num || !den) return 0;
+    const double freq = (double)num / (double)den;
+    for (u32 i = 0; i < sizeof k_vdec_rates / sizeof k_vdec_rates[0]; i++) {
+        const double want = (double)k_vdec_rates[i].num / (double)k_vdec_rates[i].den;
+        const double tol = k_vdec_rates[i].den == 1 ? 0.001 : 0.002;
+        if (freq > want - tol && freq < want + tol) return k_vdec_rates[i].code;
+    }
+    return 0;
+}
+
+static u64 vdec_frame_ticks(u32 frc)
+{
+    for (u32 i = 0; i < sizeof k_vdec_rates / sizeof k_vdec_rates[0]; i++)
+        if (k_vdec_rates[i].code == frc)
+            return 90000ull * k_vdec_rates[i].den / k_vdec_rates[i].num;
+    return 90000ull / 30u;
+}
+
 static void vdec_on_picture(void* ctx, const VdecFfPicture* pic)
 {
     VdecSlot* v = (VdecSlot*)ctx;
@@ -104,8 +139,14 @@ static void vdec_on_picture(void* ctx, const VdecFfPicture* pic)
     q->item.startAddr = au->startAddr;
     q->item.size      = au->size;
     q->item.auNum     = pic->token;
-    q->item.pts       = au->pts;
-    q->item.dts       = au->dts;
+    q->frc = vdec_frame_rate_code(pic->rate_num, pic->rate_den);
+    if (!q->frc) q->frc = CELL_VDEC_FRC_30;
+    if (au->pts != ~0ull) v->nextPts = au->pts;
+    if (au->dts != ~0ull) v->nextDts = au->dts;
+    q->item.pts       = v->nextPts;
+    q->item.dts       = v->nextDts;
+    v->nextPts += vdec_frame_ticks(q->frc);
+    v->nextDts += vdec_frame_ticks(q->frc);
     q->item.userData  = au->userData;
     q->item.status    = 0;
     q->item.picFmt    = CELL_VDEC_PIC_FMT_YUV420P;
@@ -174,13 +215,27 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
             s_vdec[i].cbArg  = cb_ea ? vm_read32(cb_ea + 4) : 0;
             s_vdec[i].ff = vdec_ff_open(codec_type);
             vm_write32((u32)(uintptr_t)handle, (u32)i);
-            printf("[cellVdec] Open -> handle=%u\n", i);
+            printf("[cellVdec] Open -> handle=%u cb=0x%08X arg=0x%08X\n", i,
+                   s_vdec[i].cbFunc, s_vdec[i].cbArg);
             if (s_vdec[i].ff)
                 printf("[cellVdec] decoding with libavcodec\n");
             return CELL_OK;
         }
     }
     return (s32)CELL_VDEC_ERROR_BUSY;
+}
+
+s32 cellVdecQueryAttrEx(const void* type, void* attr)
+{
+    return cellVdecQueryAttr((const CellVdecType*)type, attr);
+}
+
+s32 cellVdecOpenEx(const void* type, const void* res, const CellVdecCb* cb,
+                   CellVdecHandle* handle)
+{
+    printf("[cellVdec] OpenEx\n");
+    return cellVdecOpen((const CellVdecType*)type, (const CellVdecResource*)res, cb,
+                        handle);
 }
 
 s32 cellVdecClose(CellVdecHandle handle)
@@ -207,6 +262,8 @@ s32 cellVdecStartSeq(CellVdecHandle handle)
         return (s32)CELL_VDEC_ERROR_ARG;
 
     s_vdec[handle].seqStarted = 1;
+    s_vdec[handle].nextPts = 0;
+    s_vdec[handle].nextDts = 0;
     if (s_vdec[handle].ff) {
         /* A new sequence: nothing from the last one is shown. */
         vdec_ff_reset(s_vdec[handle].ff);
@@ -345,23 +402,29 @@ static void vdec_write_item(CellVdecHandle handle, const CellVdecPicItem* p)
     vm_write16(info + 2, p->height);
 }
 
-/* The decoder path also reports the picture type.
- * ASSUMPTION (field order of the SDK's CellVdecAvcInfo / CellVdecMpeg2Info,
- * not yet checked against a title):
- *   AVC   +0x04 u8 pictureType[2] (0 I, 1 P, 2 B, 3 unknown),
- *         +0x06 u8 idrPictureFlag;
- *   MPEG2 +0x12 u8 picture_coding_type[2] (1 I, 2 P, 3 B, as in the bitstream).
- * pict_type is FFmpeg's (1 I, 2 P, 3 B, 0 none). */
 static void vdec_write_pic_type(CellVdecHandle handle, const VdecPic* q)
 {
     u32 info = VDEC_INFO_EA(handle);
     int t = q->pictType;
+    const u32 frc = q->frc ? q->frc : CELL_VDEC_FRC_30;
     if (s_vdec[handle].codecType == CELL_VDEC_CODEC_TYPE_AVC) {
         vm_write8(info + 0x04, (u8)(t >= 1 && t <= 3 ? t - 1 : 3));
         vm_write8(info + 0x05, 3);
         vm_write8(info + 0x06, (u8)(q->key && t == 1));
+        vm_write8(info + 0x1B, 1);
+        vm_write8(info + 0x1C, (u8)(frc - CELL_VDEC_FRC_24000DIV1001));
+        vm_write8(info + 0x1D, 1);
     } else if (s_vdec[handle].codecType == CELL_VDEC_CODEC_TYPE_MPEG2) {
+        vm_write8(info + 0x04, 1);
+        vm_write8(info + 0x05, (u8)(frc - CELL_VDEC_FRC_24000DIV1001 + 1));
+        vm_write8(info + 0x06, 1);
+        vm_write8(info + 0x07, 1);
+        vm_write8(info + 0x08, 5);
         vm_write8(info + 0x12, (u8)(t >= 1 && t <= 3 ? t : 0));
+        vm_write8(info + 0x13, 0);
+        vm_write8(info + 0x14, 3);
+        vm_write8(info + 0x15, 3);
+        vm_write8(info + 0x18, 1);
     }
 }
 
@@ -385,6 +448,13 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
     if (!s_vdec[handle].hasPic)
         return (s32)CELL_VDEC_ERROR_EMPTY;
     vdec_write_item(handle, &v->lastPic);
+    {
+        VdecPic stub;
+        memset(&stub, 0, sizeof stub);
+        stub.pictType = 1;
+        stub.key = 1;
+        vdec_write_pic_type(handle, &stub);
+    }
     vm_write32(out, VDEC_ITEM_EA(handle));
     return CELL_OK;
 }

@@ -211,8 +211,8 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 static int audio_backend_room(void)
 {
     if (!s_sdl_audio_dev) return -1;
-    return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) <
-           CELL_AUDIO_BLOCK_SAMPLES * 4 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
+    return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) <=
+           CELL_AUDIO_BLOCK_SAMPLES * 3 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
 }
 
 static void audio_backend_wait(void) { SDL_Delay(1); }
@@ -603,21 +603,56 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     return 0;
 }
 #else
+static uint64_t audio_monotonic_ns(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+}
+
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
+    uint64_t anchor = audio_monotonic_ns(), blocks = 0;
+    const int report = getenv("AUDIO_RATE") != NULL;
+    uint64_t report_start = anchor, report_blocks = 0, silent_blocks = 0;
     while (s_mix_thread_running) {
+        const int room = audio_backend_room();
+        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) {
+            audio_backend_wait();
+            continue;
+        }
+        if (room < 0) {
+            const uint64_t now = audio_monotonic_ns();
+            const uint64_t offset = blocks * CELL_AUDIO_BLOCK_SAMPLES *
+                                    1000000000ull / CELL_AUDIO_SAMPLE_RATE;
+            const uint64_t due = anchor + offset;
+            if (now < due) { usleep(1000); continue; }
+            if (now - due > 50000000ull) anchor = now - offset;
+        }
+        blocks++;
         audio_mix_one_block();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
 
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
-        } else {
-            usleep(2000);
+        if (report) {
+            report_blocks++;
+            int nonzero = 0;
+            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++)
+                if (s_mix_buffer[i] != 0.0f) { nonzero = 1; break; }
+            silent_blocks += !nonzero;
+            const uint64_t now = audio_monotonic_ns();
+            if (now - report_start >= 5000000000ull) {
+                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), "
+                        "silent %.1f%%, queued %.2f ms\n",
+                        report_blocks * 1e9 / (now - report_start),
+                        100.0 * silent_blocks / report_blocks,
+                        audio_backend_queued_samples() * 1000.0 / CELL_AUDIO_SAMPLE_RATE);
+                report_start = now;
+                report_blocks = silent_blocks = 0;
+            }
         }
     }
 
@@ -801,6 +836,7 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     u32 guest_buf = 0x58000000u + (u32)found * 0x200000u;
     u32 guest_ridx = guest_buf + 0x100000u;
     if (vm_commit(guest_buf, 0x200000u) != CELL_OK) {
+        printf("[cellAudio] PortOpen: cannot commit guest window 0x%08X\n", guest_buf);
         port->in_use = 0;
         mutex_unlock(&s_audio_mutex);
         return CELL_AUDIO_ERROR_AUDIOSYSTEM;
@@ -813,7 +849,9 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     port->port_addr     = guest_buf;
     port->read_idx_addr = guest_ridx;
 
-    vm_write32(portNum_ea, (u32)found);   /* guest out-param */
+    vm_write32(portNum_ea, (u32)found);
+    printf("[cellAudio] PortOpen -> port %d buf=0x%08X readIndex=0x%08X\n",
+           found, guest_buf, guest_ridx);
 
     mutex_unlock(&s_audio_mutex);
     return CELL_OK;

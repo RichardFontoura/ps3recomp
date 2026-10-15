@@ -138,7 +138,25 @@ static u32 open_decoder(u32 codec)
     return vm_read32(G_HANDLE);
 }
 
+static u32 open_decoder_ex(u32 codec)
+{
+    vm_write32(G_TYPE, codec);
+    vm_write32(G_TYPE + 4, 0);
+    vm_write32(G_TYPE + 8, 0);
+    vm_write32(G_CB, CB_OPD);
+    vm_write32(G_CB + 4, 0xC0FFEEu);
+    vm_write32(G_FMT, 0);
+    vm_write8(G_FMT + 4, 0);
+    CHECK(cellVdecQueryAttrEx((const void*)(uintptr_t)G_TYPE, (void*)(uintptr_t)G_FMT) == CELL_OK);
+    CHECK(vm_read32(G_FMT) != 0 && vm_read8(G_FMT + 4) != 0);
+    CHECK(cellVdecOpenEx((const void*)(uintptr_t)G_TYPE, NULL, (const CellVdecCb*)(uintptr_t)G_CB,
+                         (CellVdecHandle*)(uintptr_t)G_HANDLE) == CELL_OK);
+    return vm_read32(G_HANDLE);
+}
+
 static u64 au_pts(int i) { return 90000ull + 3600ull * (u64)i; }
+
+static int s_no_pts;
 
 static s32 submit(u32 h, const u8* es, int i)
 {
@@ -146,8 +164,8 @@ static s32 submit(u32 h, const u8* es, int i)
     memcpy(vm_base + G_AU, es + s_au_off[i], size);
     vm_write32(G_AUINFO + 0x00, G_AU);
     vm_write32(G_AUINFO + 0x04, size);
-    vm_write64(G_AUINFO + 0x08, au_pts(i));
-    vm_write64(G_AUINFO + 0x10, (u64)i);                    /* dts */
+    vm_write64(G_AUINFO + 0x08, s_no_pts ? ~0ull : au_pts(i));
+    vm_write64(G_AUINFO + 0x10, s_no_pts ? ~0ull : (u64)i);
     vm_write64(G_AUINFO + 0x18, 0xABCD0000ull + (u64)i);    /* userData */
     return cellVdecDecodeAu(h, 0, (const CellVdecAuInfo*)(uintptr_t)G_AUINFO);
 }
@@ -160,7 +178,7 @@ static void set_format(u32 type, u32 matrix, u8 alpha)
 }
 
 /* Pictures taken so far in this run, as GetPicItem described them. */
-typedef struct { u64 pts, dts, user; u32 w, h, type, idr; } Item;
+typedef struct { u64 pts, dts, user; u32 w, h, type, idr, frc; } Item;
 static Item s_items[MAX_AU * 2];
 static int s_npic;
 static u8* s_frames;            /* s_npic pictures, frame_size each */
@@ -181,6 +199,7 @@ static void take_pictures(u32 h, u32 codec, u32 fmt_type)
         x->h = vm_read16(info + 2);
         x->type = codec == CELL_VDEC_CODEC_TYPE_AVC ? vm_read8(info + 4) : vm_read8(info + 0x12);
         x->idr = vm_read8(info + 6);
+        x->frc = codec == CELL_VDEC_CODEC_TYPE_AVC ? vm_read8(info + 0x1C) : vm_read8(info + 5);
         CHECK(vm_read32(it + 0x00) == codec);
         set_format(fmt_type, 0, 0xFF);
         CHECK(cellVdecGetPicture(h, (const void*)(uintptr_t)G_FMT,
@@ -261,7 +280,17 @@ static int mode_stub(int argc, char** argv)
         CHECK(vm_read64(it + 0x30) == 0xABCD0000ull + (u64)i);
         CHECK(vm_read32(it + 0x48) == VDEC_INFO_EA(h));
         CHECK(vm_read16(it + 0x80) == 1280 && vm_read16(it + 0x82) == 720);
-        for (u32 o = 0x84; o < 0x100; o++) CHECK(vm_read8(it + o) == 0);
+        static const u8 avc_info[][2] = { {0x84, 0}, {0x85, 3}, {0x86, 1}, {0x9B, 1}, {0x9C, 4}, {0x9D, 1} };
+        static const u8 m2v_info[][2] = { {0x84, 1}, {0x85, 5}, {0x86, 1}, {0x87, 1}, {0x88, 5},
+                                          {0x92, 1}, {0x94, 3}, {0x95, 3}, {0x98, 1} };
+        const int avc = codec == CELL_VDEC_CODEC_TYPE_AVC;
+        const u8 (*want)[2] = avc ? avc_info : m2v_info;
+        const int nwant = avc ? 6 : 9;
+        for (u32 o = 0x84; o < 0x100; o++) {
+            u8 v = 0;
+            for (int k = 0; k < nwant; k++) if (want[k][0] == o) v = want[k][1];
+            CHECK(vm_read8(it + o) == v);
+        }
         /* GetPictureExt never existed without a decoder: CELL_OK, nothing done. */
         CHECK(cellVdecGetPictureExt(h, (const void*)(uintptr_t)G_FMT,
                                     (void*)(uintptr_t)G_PIC, 0) == CELL_OK);
@@ -296,7 +325,7 @@ static int mode_decode(int argc, char** argv)
     CHECK(nref > 0 && rlen == (size_t)nref * s_frame_size);
     s_frames = (u8*)malloc((size_t)MAX_AU * 2 * s_frame_size);
 
-    u32 h = open_decoder(codec);
+    u32 h = open_decoder_ex(codec);
     if (!s_vdec[h].ff) {
         /* No loadable libavcodec here (not installed, or not on the loader
          * path): a skip, not a failure. A library that loads but cannot open
@@ -333,6 +362,19 @@ static int mode_decode(int argc, char** argv)
         CHECK(types[1] > 0 && types[2] > 0 && types[3] > 0 && reordered > 0);
         if (codec == CELL_VDEC_CODEC_TYPE_AVC) CHECK(idr > 0);
     }
+
+    const u32 want_frc = codec == CELL_VDEC_CODEC_TYPE_AVC
+        ? CELL_VDEC_FRC_25 - CELL_VDEC_FRC_24000DIV1001
+        : CELL_VDEC_FRC_25 - CELL_VDEC_FRC_24000DIV1001 + 1;
+    for (int i = 0; i < s_npic; i++) CHECK(s_items[i].frc == want_frc);
+    s_no_pts = 1;
+    run_sequence(h, codec, es, -1, 3);
+    s_no_pts = 0;
+    CHECK(s_npic == nref);
+    for (int i = 0; i < s_npic; i++)
+        CHECK(s_items[i].pts == 3600ull * (u64)i && s_items[i].dts == 3600ull * (u64)i);
+    printf("  frame rate code %u, PTS synthesized at 3600 ticks a picture without AU PTS\n",
+           want_frc);
 
     /* Negative control 1: the comparison sees a single changed byte. */
     s_frames[s_frame_size * 3 + 123] ^= 1;

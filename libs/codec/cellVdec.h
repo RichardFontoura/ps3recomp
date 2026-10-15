@@ -39,6 +39,15 @@ extern "C" {
 #define CELL_VDEC_PIC_FMT_YUV420P     0
 #define CELL_VDEC_PIC_FMT_ARGB8888    1
 
+#define CELL_VDEC_FRC_24000DIV1001    0x80
+#define CELL_VDEC_FRC_24              0x81
+#define CELL_VDEC_FRC_25              0x82
+#define CELL_VDEC_FRC_30000DIV1001    0x83
+#define CELL_VDEC_FRC_30              0x84
+#define CELL_VDEC_FRC_50              0x85
+#define CELL_VDEC_FRC_60000DIV1001    0x86
+#define CELL_VDEC_FRC_60              0x87
+
 /* Callback message types */
 #define CELL_VDEC_MSG_TYPE_AUDONE      0
 #define CELL_VDEC_MSG_TYPE_PICOUT      1
@@ -102,6 +111,9 @@ typedef struct CellVdecCb {
 
 s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
                   const CellVdecCb* cb, CellVdecHandle* handle);
+s32 cellVdecQueryAttrEx(const void* type, void* attr);
+s32 cellVdecOpenEx(const void* type, const void* res, const CellVdecCb* cb,
+                   CellVdecHandle* handle);
 s32 cellVdecClose(CellVdecHandle handle);
 
 s32 cellVdecStartSeq(CellVdecHandle handle);
