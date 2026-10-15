@@ -86,16 +86,14 @@ s32 cellSysmoduleFinalize(void)   { return CELL_OK; }
 
 s32 cellSysmoduleLoadModule(u16 id)
 {
-    printf("[cellSysmodule] LoadModule(id=0x%04X '%s')\n",
-           id, sysmodule_id_to_name(id));
-
     int slot = sysmodule_slot(id);
-    if (slot < 0)
+    if (slot < 0) {
+        fprintf(stderr, "[cellSysmodule] LoadModule FAILED id=0x%04X name=%s result=0x%08X\n",
+                id, sysmodule_id_to_name(id), (unsigned)CELL_SYSMODULE_ERROR_UNKNOWN);
         return CELL_SYSMODULE_ERROR_UNKNOWN;
-
-    if (s_module_loaded[slot])
-        return CELL_OK;  /* Already loaded — return success (some games treat DUPLICATED as fatal) */
-
+    }
+    fprintf(stderr, "[cellSysmodule] LoadModule id=0x%04X name=%s result=CELL_OK mode=HLE already_loaded=%d; records module state, does not load a PRX or guarantee all imports implemented\n",
+            id, sysmodule_id_to_name(id), s_module_loaded[slot] != 0);
     s_module_loaded[slot] = 1;
     return CELL_OK;
 }

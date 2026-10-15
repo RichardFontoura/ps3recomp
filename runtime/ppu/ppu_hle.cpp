@@ -16,6 +16,7 @@
  *
  * Compiled as C++ (matches the lifted output). Game-agnostic.
  */
+#include "ppu_diagnostics.h"
 #include "ppu_recomp.h"   /* ppu_context */
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
@@ -658,8 +659,12 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
             return;
         }
-        static int logged = 0;
-        if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
+        uint64_t gap_count = ppu_diag_hit("hle:" + std::to_string(nid));
+        if (gap_count)
+            fprintf(stderr, "[gap] hle unresolved NID=0x%08X name=%s thread=%llu pc=0x%08X lr=0x%08X r3=0x%llX r4=0x%llX hits=%llu; no registered handler; compatibility fallback follows (normally CELL_OK)\n",
+                    nid, e && e->name ? e->name : "unknown", (unsigned long long)ctx->thread_id,
+                    (uint32_t)ctx->cia, (uint32_t)ctx->lr, (unsigned long long)ctx->gpr[3],
+                    (unsigned long long)ctx->gpr[4], (unsigned long long)gap_count);
         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD
          * callbacks (statCallback/fileCallback) to learn the cellSaveDataAutoLoad2
          * protocol so it can be implemented. */

@@ -1931,6 +1931,37 @@ static unsigned s_pic_count;
 static volatile long s_pic_hits, s_pic_rejects;
 static SRWLOCK s_pic_capture_lock = SRWLOCK_INIT;
 
+typedef struct {
+    int image;
+    uint32_t pc;
+    uint64_t hits;
+} spu_gap_record;
+
+static SPU_TLS spu_gap_record s_spu_gaps[2048];
+
+static void spu_gap_note(spu_context* ctx, uint32_t pc, const char* reason)
+{
+    unsigned start = ((pc >> 2) ^ ((unsigned)ctx->image_id * 2654435761u)) & 2047u;
+    unsigned i = start;
+    uint64_t count = 1;
+    int tracked = 0;
+    do {
+        spu_gap_record* record = &s_spu_gaps[i];
+        if (!record->hits || (record->image == ctx->image_id && record->pc == pc)) {
+            record->image = ctx->image_id;
+            record->pc = pc;
+            count = ++record->hits;
+            tracked = 1;
+            break;
+        }
+        i = (i + 1) & 2047u;
+    } while (i != start);
+    if (count <= 3 || (count & (count - 1)) == 0)
+        fprintf(stderr, "[gap] spu image=%d pc=0x%05X host_thread=%lu hits=%llu reason=%s action=interpreter%s\n",
+                ctx->image_id, pc, (unsigned long)GetCurrentThreadId(),
+                (unsigned long long)count, reason, tracked ? "" : " tracking-table-full");
+}
+
 static uint64_t spu_pic_key(const uint8_t* p)
 {
     uint64_t a, b;
@@ -2211,11 +2242,7 @@ static int spu_smc_microstep(spu_context* ctx)
          * III`s job kernel dies here on an `ilh` at LS 0x6638 -- a perfectly
          * ordinary instruction the interpreter handles -- and with it the
          * decompression job it was running never completes. */
-        { static int _n = 0;
-          if (_n++ < 8)
-              fprintf(stderr, "[spu-smc] microstep img=%d pc=0x%05X word 0x%08X not in the"
-                      " microstep set -- handing to the interpreter (steps=%d)\n",
-                      ctx->image_id, pc, w, steps); }
+        spu_gap_note(ctx, pc, "microstep-instruction-fallback");
         ctx->pc = pc;
         if (!spu_interp_run_until(ctx, pc, ctx->drain_ret_pc))
             return 0;
@@ -2507,10 +2534,7 @@ void spu_indirect_branch(spu_context* ctx)
           static int s_iu = -1;
           if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = e ? 1 : 0; }
           if (s_iu && w0) {
-              static int _n = 0;
-              if (_n++ < 8)
-                  fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
-                          "(runtime-loaded code)\n", ctx->image_id, p);
+              spu_gap_note(ctx, p, "unlifted-local-store");
               spu_interp_run(ctx, p);
               return;
           } }

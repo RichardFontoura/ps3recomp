@@ -1,3 +1,5 @@
+#include "ppu_diagnostics.h"
+#include <errno.h>
 /*
  * ps3recomp - PPU runtime loader
  *
@@ -2981,12 +2983,11 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
  * continue (the result is undefined, but it won't crash the link). */
 extern "C" void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx)
 {
-    (void)ctx;
-    static int logged = 0;
-    if (logged < 20) {
-        fprintf(stderr, "[ppu] call to unlifted function 0x%08X\n", (uint32_t)addr);
-        logged++;
-    }
+    uint64_t count = ppu_diag_hit("ppu:" + std::to_string(addr));
+    if (count)
+        fprintf(stderr, "[gap] ppu unlifted function target=0x%08X thread=%llu pc=0x%08X lr=0x%08X hits=%llu action=return-without-execution\n",
+                (uint32_t)addr, (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia,
+                (uint32_t)ctx->lr, (unsigned long long)count);
 }
 
 /* The real lv2 syscall table (runtime/syscalls/lv2_register.c). */
@@ -3289,11 +3290,11 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                 return;
             }
         }
-        static int logged = 0;
-        if (logged < 30) {
-            fprintf(stderr, "[ppu] lv2_syscall %llu (stub)\n", (unsigned long long)num);
-            logged++;
-        }
+        uint64_t count = ppu_diag_hit("syscall:" + std::to_string(num));
+        if (count)
+            fprintf(stderr, "[gap] ppu lv2_syscall=%llu unimplemented thread=%llu pc=0x%08X lr=0x%08X r3=0x%llX hits=%llu action=faking-CELL_OK\n",
+                    (unsigned long long)num, (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia,
+                    (uint32_t)ctx->lr, (unsigned long long)ctx->gpr[3], (unsigned long long)count);
         /* The UNIMPLEMENTED syscalls are the ones a trace is most wanted for, and
          * they were the only ones it skipped: sc_trace ran on both handled paths
          * but not here, so PS3_SCTRACE showed everything except the gaps. Snapshot
@@ -3319,7 +3320,11 @@ static uint64_t be64(const uint8_t* p) { return ((uint64_t)be32(p) << 32) | be32
 extern "C" uint32_t ppu_load_elf(const char* path)
 {
     FILE* f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "[ppu] cannot open %s\n", path); return 0; }
+    if (!f) {
+        int host_error = errno;
+        fprintf(stderr, "[ppu] ELF load FAILED path='%s' errno=%d (%s)\n", path, host_error, strerror(host_error));
+        return 0;
+    }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);

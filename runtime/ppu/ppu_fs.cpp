@@ -1,3 +1,5 @@
+#include "ppu_diagnostics.h"
+#include <errno.h>
 /*
  * ps3recomp - cellFs VFS (sys_fs HLE)
  *
@@ -215,7 +217,12 @@ static void cellFsOpen(ppu_context* ctx)
     }
     int hfd = open(hpath, oflags | O_BINARY, 0666);
     if (hfd < 0) {
-        fprintf(stderr, "[fs] open FAIL '%s' -> '%s'\n", gpath, hpath);
+        int host_error = errno;
+        uint64_t count = ppu_diag_hit(std::string("fs:open:") + gpath + ":" + std::to_string(host_error));
+        if (count)
+            fprintf(stderr, "[fs] open FAIL guest='%s' host='%s' errno=%d (%s) thread=%llu pc=0x%08X lr=0x%08X hits=%llu guest_result=0x%08X\n",
+                    gpath, hpath, host_error, strerror(host_error), (unsigned long long)ctx->thread_id,
+                    (uint32_t)ctx->cia, (uint32_t)ctx->lr, (unsigned long long)count, (uint32_t)CELL_FS_ENOENT);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
     const char* fmode = (acc == CELL_FS_O_RDWR)
@@ -290,7 +297,12 @@ static void cellFsSdataOpen(ppu_context* ctx)
 
     int hfd = open(hpath, O_RDONLY | O_BINARY, 0666);
     if (hfd < 0) {
-        fprintf(stderr, "[fs] SdataOpen FAIL '%s' -> '%s'\n", gpath, hpath);
+        int host_error = errno;
+        uint64_t count = ppu_diag_hit(std::string("fs:SdataOpen:") + gpath + ":" + std::to_string(host_error));
+        if (count)
+            fprintf(stderr, "[fs] SdataOpen FAIL guest='%s' host='%s' errno=%d (%s) thread=%llu pc=0x%08X lr=0x%08X hits=%llu guest_result=0x%08X\n",
+                    gpath, hpath, host_error, strerror(host_error), (unsigned long long)ctx->thread_id,
+                    (uint32_t)ctx->cia, (uint32_t)ctx->lr, (unsigned long long)count, (uint32_t)CELL_FS_ENOENT);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
     FILE* f = fdopen(hfd, "rb");
@@ -572,7 +584,12 @@ static void cellFsStat(ppu_context* ctx)
     host_path(hpath, sizeof hpath, gpath);
     struct stat st;
     if (stat(hpath, &st) != 0) {
-        if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
+        int host_error = errno;
+        uint64_t count = ppu_diag_hit(std::string("fs:stat:") + gpath + ":" + std::to_string(host_error));
+        if (count)
+            fprintf(stderr, "[fs] stat FAIL guest='%s' host='%s' errno=%d (%s) thread=%llu pc=0x%08X lr=0x%08X hits=%llu; may be an optional existence probe\n",
+                    gpath, hpath, host_error, strerror(host_error), (unsigned long long)ctx->thread_id,
+                    (uint32_t)ctx->cia, (uint32_t)ctx->lr, (unsigned long long)count);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
