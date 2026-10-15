@@ -7,6 +7,7 @@
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
 #include <setjmp.h>
+extern int g_spu_wws_pm_image;
 
 /* See spu_context.h `irq_frame`. */
 typedef struct spu_irq_frame {
@@ -121,7 +122,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
 
     static int s_on = -1;
     if (s_on < 0) s_on = getenv("SPU_JOBDRAIN") ? 1 : 0;
-    if (!s_on || ctx->image_id != 2 || !ctx->policy_mode) return;
+    if (!s_on || ctx->image_id != g_spu_wws_pm_image || !ctx->policy_mode) return;
 
     /* 0x2318 = the type-2 load's ring-full bail (resets scan, retries). */
     if ((ctx->pc & 0x3FFFF) != 0x2318) return;

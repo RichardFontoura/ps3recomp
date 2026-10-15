@@ -124,6 +124,10 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
  * waiting on PPU-side signals (running them inline deadlocks). */
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea);
+void spu_taskset_mark_dispatched(uint32_t taskset_ea, uint32_t task_id);
+void spu_taskset_bits_committed(uint32_t line);
+void spu_taskset_track(uint32_t taskset_ea);
+void spu_taskset_bit_update(uint32_t bitset_ea, uint32_t taskId, int set);
 
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);

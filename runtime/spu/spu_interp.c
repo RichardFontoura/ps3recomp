@@ -32,6 +32,15 @@ typedef struct {
     uint32_t tgt;     /* absolute LS branch target (br-family) */
 } spu_ins;
 
+typedef struct {
+    uint32_t pc, insn, valid;
+    spu_ins  d;
+} spu_decoded_slot;
+
+#define SPU_DECODE_CACHE_SLOTS 65536u
+
+static _Thread_local spu_decoded_slot* s_decode_cache;
+
 static int32_t sx(uint32_t v, int bits) {
     uint32_t m = 1u << (bits - 1);
     return (int32_t)((v ^ m) - m);
@@ -106,12 +115,25 @@ static void spu_decode1(uint32_t insn, uint32_t pc, spu_ins* d) {
 #define I   (d.imm)
 #define PREF(r) ((r)._u32[0])
 
+static void spu_decode_cached(uint32_t insn, uint32_t pc, spu_ins* d) {
+    spu_decoded_slot* cache = s_decode_cache;
+    if (!cache) {
+        cache = (spu_decoded_slot*)calloc(SPU_DECODE_CACHE_SLOTS, sizeof *cache);
+        if (!cache) { spu_decode1(insn, pc, d); return; }
+        s_decode_cache = cache;
+    }
+    spu_decoded_slot* slot = &cache[(pc >> 2) & (SPU_DECODE_CACHE_SLOTS - 1)];
+    if (slot->valid && slot->pc == pc && slot->insn == insn) { *d = slot->d; return; }
+    spu_decode1(insn, pc, d);
+    slot->pc = pc; slot->insn = insn; slot->valid = 1; slot->d = *d;
+}
+
 static int spu_step(spu_context* ctx) {
     uint32_t pc = ctx->pc, m = pc & SPU_LS_MASK;
     const uint8_t* p = ctx->ls;
     uint32_t insn = ((uint32_t)p[m] << 24) | ((uint32_t)p[m+1] << 16)
                   | ((uint32_t)p[m+2] << 8) | p[m+3];
-    spu_ins d; spu_decode1(insn, pc, &d);
+    spu_ins d; spu_decode_cached(insn, pc, &d);
     uint32_t next = pc + 4;
 
     switch (d.op) {
@@ -263,7 +285,16 @@ static int spu_step(spu_context* ctx) {
     case SPU_mpys:  DST = spu_mpys(A,B); break;
     case SPU_mpyhh: DST = spu_mpyhh(A,B); break;
     case SPU_mpyhhu:DST = spu_mpyhhu(A,B); break;
-    case SPU_mpyhha:DSTC = spu_mpyhha(A,B,T); break;  /* RRR */
+    case SPU_mpyhha:DST = spu_mpyhha(A,B,T); break;
+    case SPU_mpyhhau:DST = spu_mpyhhau(A,B,T); break;
+    case SPU_mpyui: DST = spu_mpyui(A,I); break;
+    case SPU_bgx:   DST = spu_bgx(A,B,T); break;
+    case SPU_rothmi:DST = spu_rothmi(A,(int)I); break;
+    case SPU_rotmahi:DST = spu_rotmahi(A,(int)I); break;
+    case SPU_rotmah: { u128 r; for (int i = 0; i < 8; i++) { uint32_t sh = (0u - B._u16[i]) & 0x1F;
+        r._s16[i] = (int16_t)(sh > 15 ? (A._s16[i] >> 15) : (A._s16[i] >> sh)); } DST = r; break; }
+    case SPU_bisled: { uint32_t t = PREF(A) & 0x3FFFC; DST = spu_link(pc + 4);
+        if (ctx->event_status & ctx->event_mask) next = t; break; }
     /* rotate / shift extras */
     case SPU_rothm:    DST = spu_rothm(A,B); break;
     case SPU_rotqmbi:  DST = spu_rotqmbi(A,B); break;
@@ -288,7 +319,7 @@ static int spu_step(spu_context* ctx) {
     case SPU_brhz: if ((PREF(DST) & 0xFFFF) == 0) next = d.tgt; break;
     case SPU_brhnz:if ((PREF(DST) & 0xFFFF) != 0) next = d.tgt; break;
     case SPU_bi:   next = PREF(A) & 0x3FFFC; break;
-    case SPU_bisl: DST = spu_link(pc + 4); next = PREF(A) & 0x3FFFC; break;
+    case SPU_bisl: next = PREF(A) & 0x3FFFC; DST = spu_link(pc + 4); break;
     case SPU_iret: next = ctx->srr0 & 0x3FFFC; break;
     case SPU_biz:  if (PREF(DST) == 0) next = PREF(A) & 0x3FFFC; break;
     case SPU_binz: if (PREF(DST) != 0) next = PREF(A) & 0x3FFFC; break;
@@ -359,6 +390,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
     static int _g1=-1; if(_g1<0){const char*e=getenv("YDKJ_CRI_GATE1TRACE");_g1=e?atoi(e):0;}
     static int _g1in=0;
     uint32_t ring[64]; int rc=0, rn=0;
+    uint32_t sequential_pc = 0xFFFFFFFFu;
     for (;;) {
         /* Match the lifted path: only synthetic HLE tasks may bypass the
          * resident policy. Real tasksets also store 0xA70 in their API table.
@@ -375,12 +407,12 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
                 continue;
             }
         }
-        /* Rejoin the compiled fast path only for images that HAVE lifted
-         * functions (image_id >= 0). image_id < 0 = pure interpretation: an
-         * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
-         * another image's functions that happen to share an LS address. */
-        /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
-        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+        if (ctx->image_id >= 0 &&
+            ((stop_lsa && ctx->pc == stop_lsa) ||
+             (ctx->pc != sequential_pc && spu_lifted_lookup(ctx, ctx->pc)))) {
+            g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc;
+        }
+        sequential_pc = ctx->pc + 4;
         g_spu_interp_last_pc = ctx->pc;
         if (_g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);

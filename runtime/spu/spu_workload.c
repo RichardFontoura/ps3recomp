@@ -5,6 +5,7 @@
  * it with the SPURS task ABI. cellSpurs's AddWorkload/CreateTask call
  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
  */
+#include "../trace/ps3_timeline.h"
 #include "spu_workload.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
@@ -54,10 +55,27 @@ typedef struct {
 static spu_workload_entry s_registry[SPU_WORKLOAD_MAX];
 static unsigned           s_registry_count = 0;
 
+int g_spu_wws_pm_image = 2;
+int g_spu_wws_job_image = 1;
+static int s_wws_job_image_named = 0;
+
+static void spu_workload_note_wws_role(int image_id, const char* name)
+{
+    if (!name) return;
+    if (strncmp(name, "pm_wwsjob", 9) == 0) {
+        g_spu_wws_pm_image = image_id;
+        if (!s_wws_job_image_named) g_spu_wws_job_image = -1;
+    } else if (strncmp(name, "job_wws", 7) == 0) {
+        g_spu_wws_job_image = image_id;
+        s_wws_job_image_named = 1;
+    }
+}
+
 void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
                                int image_id, const char* name)
 {
     if (!fn) return;
+    spu_workload_note_wws_role(image_id, name);
     for (unsigned i = 0; i < s_registry_count; i++) {
         if (s_registry[i].fp == fingerprint) {     /* idempotent on fingerprint */
             s_registry[i].fn       = fn;
@@ -369,7 +387,7 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
  * Taskset layout: bitsets of 16 bytes at +0x10 ready, +0x20 pending,
  * +0x30 enabled (task 0 = MSB of byte 0); task_info[t] at +0x80 + 0x30*t with
  * the ELF EA at +0x14 and the context save EA at +0x1C. */
-#define TS_TRACK 8
+#define TS_TRACK 16
 static struct { uint32_t ea; uint8_t running[16]; } s_ts_run[TS_TRACK];
 static volatile LONG s_ts_lock;
 static uint8_t* ts_running(uint32_t taskset_ea)
@@ -391,20 +409,16 @@ static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
     ts_unlock();
 }
 
-static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
+void spu_taskset_mark_dispatched(uint32_t taskset_ea, uint32_t task_id)
+{
+    spu_taskset_mark(taskset_ea, task_id, 1);
+}
+
+static void spu_taskset_start_ready(uint32_t taskset_ea, uint8_t* run, int after_task)
 {
     extern uint8_t* vm_base;
     extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-    ts_lock();
-    uint8_t* ts = vm_base + taskset_ea;
-    uint8_t* run = ts_running(taskset_ea);
-    if (done_task < 128) {
-        uint8_t m = (uint8_t)(0x80u >> (done_task & 7));
-        ts[0x10 + done_task / 8] &= (uint8_t)~m;
-        ts[0x20 + done_task / 8] &= (uint8_t)~m;
-        ts[0x30 + done_task / 8] &= (uint8_t)~m;
-        if (run) run[done_task / 8] &= (uint8_t)~m;
-    }
+    const uint8_t* ts = vm_base + taskset_ea;
     for (uint32_t t = 0; t < 128 && run; t++) {
         uint8_t m = (uint8_t)(0x80u >> (t & 7));
         if (!(ts[0x30 + t / 8] & m) || (run[t / 8] & m)) continue;
@@ -414,17 +428,56 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
                        ((uint32_t)ti[0x16] << 8) | ti[0x17];
         uint32_t ctx = ((uint32_t)ti[0x1C] << 24) | ((uint32_t)ti[0x1D] << 16) |
                        ((uint32_t)ti[0x1E] << 8) | ti[0x1F];
+        elf &= ~7u;
+        ctx &= ~0x7Fu;
         if (!elf) continue;
         size_t sz = spu_elf_image_size(vm_base + elf, 2u * 1024 * 1024);
         if (!sz) continue;
-        ts[0x20 + t / 8] &= (uint8_t)~m;                 /* pending -> started */
+        spu_taskset_bit_update(taskset_ea + 0x20, t, 0);
         run[t / 8] |= m;
-        fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
-                        "(after task %u exited)\n", t, taskset_ea, elf, done_task);
+        if (after_task >= 0)
+            fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+                            "(after task %d exited)\n", t, taskset_ea, elf, after_task);
+        else
+            fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+                            "(created by an SPU)\n", t, taskset_ea, elf);
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
         spu_workload_dispatch_async(vm_base + elf, (uint32_t)sz, ctx);
     }
+}
+
+static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
+{
+    ts_lock();
+    uint8_t* run = ts_running(taskset_ea);
+    if (done_task < 128) {
+        uint8_t m = (uint8_t)(0x80u >> (done_task & 7));
+        spu_taskset_bit_update(taskset_ea + 0x10, done_task, 0);
+        spu_taskset_bit_update(taskset_ea + 0x20, done_task, 0);
+        spu_taskset_bit_update(taskset_ea + 0x30, done_task, 0);
+        if (run) run[done_task / 8] &= (uint8_t)~m;
+    }
+    spu_taskset_start_ready(taskset_ea, run, (int)done_task);
     ts_unlock();
+}
+
+void spu_taskset_track(uint32_t taskset_ea)
+{
+    if (!taskset_ea) return;
+    ts_lock();
+    ts_running(taskset_ea);
+    ts_unlock();
+}
+
+void spu_taskset_bits_committed(uint32_t line)
+{
+    for (int i = 0; i < TS_TRACK; i++) {
+        if (s_ts_run[i].ea != line) continue;
+        ts_lock();
+        spu_taskset_start_ready(line, s_ts_run[i].running, -1);
+        ts_unlock();
+        return;
+    }
 }
 
 static void spu_async_run(spu_async_job* j)
@@ -799,7 +852,13 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
     return 0;
 }
 #else
-static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
+static void* spu_async_thread(void* p)
+{
+    ps3_timeline(PS3_TL_TASK_BEGIN, 0);
+    spu_async_run((spu_async_job*)p);
+    ps3_timeline(PS3_TL_TASK_END, 0);
+    return NULL;
+}
 #endif
 
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
@@ -903,6 +962,11 @@ static pthread_cond_t  s_sig_cv   = PTHREAD_COND_INITIALIZER;
 void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);  /* defined below */
 
 #define SPU_PARKED_MAX 64
+extern uint8_t* vm_base;
+extern void spu_lockline_lock(void);
+extern void spu_lockline_unlock(void);
+extern int  spu_coh_is_reserved(uint32_t);
+extern void spu_coh_notify_write(uint32_t);
 static volatile uint64_t s_parked[SPU_PARKED_MAX];   /* (taskset<<32)|(taskId+1), 0 = free */
 static volatile uint32_t s_parked_obj[SPU_PARKED_MAX];  /* LS[0x2FD0] wait object, 0 = unknown */
 
@@ -999,17 +1063,31 @@ int spu_taskset_signal_parked_obj(uint32_t taskset_ea, uint32_t wait_obj)
 }
 
 /* Deliver a signal to a task (callable from any PPU/host thread). */
+void spu_taskset_bit_update(uint32_t bitset_ea, uint32_t taskId, int set)
+{
+    uint8_t* p = vm_base + bitset_ea + taskId / 8u;
+    const uint8_t m = (uint8_t)(0x80u >> (taskId % 8u));
+    spu_lockline_lock();
+    *p = set ? (uint8_t)(*p | m) : (uint8_t)(*p & (uint8_t)~m);
+    if (spu_coh_is_reserved(bitset_ea)) spu_coh_notify_write(bitset_ea);
+    spu_lockline_unlock();
+}
+
 void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
 {
     if (!taskset_ea || taskId >= 128) return;
+    { static uint32_t s_wst = 1;
+      if (s_wst == 1) { const char* e = getenv("SPU_WS_TRACE"); s_wst = e ? (uint32_t)strtoul(e, 0, 16) : 0; }
+      if (s_wst == taskset_ea) { extern unsigned long long ps3_ms_now(void);
+          fprintf(stderr, "[ws] t=%llu hle-signal task=%u from=+0x%lx\n", ps3_ms_now(), taskId, (long)((char*)__builtin_return_address(0) - (char*)spu_taskset_signal_task)); } }
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);
-    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
+    spu_taskset_bit_update(taskset_ea + CSTS_SIGNALLED, taskId, 1);
     WakeAllConditionVariable(&s_sig_cv);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
     pthread_mutex_lock(&s_sig_lock);
-    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
+    spu_taskset_bit_update(taskset_ea + CSTS_SIGNALLED, taskId, 1);
     pthread_cond_broadcast(&s_sig_cv);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
@@ -1040,19 +1118,9 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
       } }
 }
 
-/* A successful PUTLLC/PUTLLUC committed the 128-byte guest line `line`.
- *
- * A task signalling another task does it on the SPU, as libspurs does: a
- * GETLLAR/PUTLLC loop that sets the target's bit in the taskset's signalled
- * bitset. That updates the guest bit the waiter checks but never touches
- * s_sig_cv, so the parked task only saw it when its 1 s timed wait ran out.
- * Twisted Metal's post-FX pipeline chains its six tasks this way several
- * times a frame and took 4 s or more per frame. Wake the waiters whenever a
- * line holding a parked taskset's signalled bitset is committed; a commit
- * that did not signal them only costs a spurious wake, which the wait loop
- * re-checks. */
 void spu_taskset_line_committed(uint32_t line)
 {
+    spu_taskset_bits_committed(line);
     for (int i = 0; i < SPU_PARKED_MAX; i++) {
         const uint64_t k = s_parked[i];
         if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
@@ -1128,6 +1196,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     /* Release the global SPU-serial lock while parked so another SPU task can
      * run (and possibly signal us); re-acquired before returning to resume. */
     spu_serial_release();
+    ps3_timeline(PS3_TL_SIGNAL_WAIT_BEGIN, taskId);
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);
     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
@@ -1139,7 +1208,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
-    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+    if (!drained) spu_taskset_bit_update(taskset_ea + CSTS_SIGNALLED, taskId, 0);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
     pthread_mutex_lock(&s_sig_lock);
@@ -1153,13 +1222,14 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
-    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+    if (!drained) spu_taskset_bit_update(taskset_ea + CSTS_SIGNALLED, taskId, 0);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
     if (drained) { static int _d = 0; if (_d++ < 24)
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
-    spu_serial_acquire();       /* resume: re-take the serial lock */
+    ps3_timeline(PS3_TL_SIGNAL_WAIT_END, taskId);
+    spu_serial_acquire();
     { extern unsigned long long ps3_ms_now(void);
       s_wait_exit_ms = ps3_ms_now(); }   /* stamp for the next entry's ran= */
     return 0;

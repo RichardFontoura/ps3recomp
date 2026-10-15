@@ -29,11 +29,12 @@
 #include <string.h>
 
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
+void spu_mfc_release(spu_context* ctx);
 
 /* Counters the intercepts in spu_channels.c maintain for the CURRENT run
  * (single writer per run; reads are diagnostic). */
-volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
-volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
+_Thread_local volatile unsigned g_spurs_pm_polls = 0;
+_Thread_local volatile unsigned g_spurs_pm_exited = 0;
 volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
 
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
@@ -56,7 +57,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * never progress its claim/stage pipeline). Image + context init happen
      * once; re-entries keep LS and only refresh the entry registers and the
      * (possibly game-updated) kernel-context fields. */
-    enum { SPURS_PM_MAX_WKL = 16 };
+    enum { SPURS_PM_MAX_WKL = 32 };
     static spu_context* s_pm_ctx[SPURS_PM_MAX_WKL][6];
     if (wid >= SPURS_PM_MAX_WKL || spu_num >= 6) return -1;
     spu_context* ctx = s_pm_ctx[wid][spu_num];
@@ -107,6 +108,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                         (unsigned long long)wkl_data);
         }
         first = 1;
+        spu_mfc_release(ctx);
         memset(ctx, 0, sizeof(*ctx));
         spu_context_init(ctx, 0);
     }
@@ -212,7 +214,10 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * has 0x11B0 == 0 and runJobNum == -1. */
     static int s_flow_all = -1;
     if (s_flow_all < 0) s_flow_all = getenv("SPURS_PM_FLOW_ALL") ? 1 : 0;
+    static int s_flow_wid = -2;
+    if (s_flow_wid == -2) { const char* fw = getenv("SPURS_PM_FLOW_WID"); s_flow_wid = fw ? atoi(fw) : -1; }
     int tracing = (s_flow && spu_num == 0 && g_pm_flow_ctx == 0 &&
+                   (s_flow_wid < 0 || (int)wid == s_flow_wid) &&
                    (s_flow_all ||
                     (g_barrier_sync_watch &&
                      (uint32_t)wkl_data == g_barrier_sync_watch)));
@@ -303,8 +308,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         /* PER-WID cap: a shared cap gets exhausted by idle wid=0/1 before the
          * jobmanager (wid=12) ever runs in a long/good run. Give each wid its
          * own budget so wid=12's pipeline is always captured. */
-        static unsigned long s_pn_wid[16] = {0};
-        unsigned long s_pn = ++s_pn_wid[wid & 15];
+        static unsigned long s_pn_wid[32] = {0};
+        unsigned long s_pn = ++s_pn_wid[wid & 31];
         if (s_pn < 300) {
             const uint8_t* L = ctx->ls;
             #define HW(o) ((L[(o)+2]<<8)|L[(o)+3])
@@ -363,7 +368,11 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
             if (ctx->ls[_i]) has_job = 1;
         for (uint32_t _i = 0xC00; _i < 0xC60 && !has_job; _i++)
             if (ctx->ls[_i]) has_job = 1;
-        if (has_job && s_dumps < 6) {
+        static int s_flow_idle = -1;
+        if (s_flow_idle < 0) s_flow_idle = getenv("SPURS_PM_FLOW_IDLE") ? 1 : 0;
+        static int s_flow_max = -1;
+        if (s_flow_max < 0) { const char* fm = getenv("SPURS_PM_FLOW_MAX"); s_flow_max = fm ? atoi(fm) : 6; }
+        if ((has_job || s_flow_idle) && s_dumps < s_flow_max) {
             s_dumps++;
             unsigned n = g_pm_flow_n; if (n > 8192) n = 8192;
             fprintf(stderr, "[pm-flow] dump#%d wid=%u %u transfers (sync-PUTLLC delta %u):",
@@ -384,7 +393,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
             { static const struct { uint32_t a, len; const char* tag; } R[] = {
                   { 0xC00, 0x60, "cmds" }, { 0xDF0, 0x40, "rec" },
                   { 0xEB0, 0x60, "ring" }, { 0x11B0, 0x20, "mark" },
-                  { 0x1270, 0x20, "busy" }, { 0x12A0, 0x10, "st12A0" },
+                  { 0x1270, 0x20, "busy" }, { 0x12A0, 0x10, "st12A0" }, { 0x1500, 0x40, "dep1500" },
                   { 0x12C0, 0x40, "state" } };
               for (unsigned r = 0; r < sizeof R / sizeof R[0]; r++) {
                   fprintf(stderr, "[pm-ls] %-6s 0x%04X:", R[r].tag, R[r].a);

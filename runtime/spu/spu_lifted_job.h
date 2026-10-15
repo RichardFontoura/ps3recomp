@@ -21,6 +21,7 @@
 #include <stdlib.h>
 
 typedef void (*spu_lifted_entry_fn)(spu_context*);
+void spu_mfc_release(spu_context* ctx);
 /* Guest RAM base, for decoding a raw SPU thread's argument block. */
 extern uint8_t* vm_base;
 
@@ -101,10 +102,8 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
             g_spu_out_mbox_hook(ctx.spu_group_id, ctx.spu_id, 1, ctx.ch_out_mbox.value);
     }
     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);
-    /* `ctx` is about to go out of scope: take it out of the reserving set
-     * first, or the coherency walk dereferences this stack frame after it is
-     * gone. See spu_coh_unregister. */
     spu_coh_unregister(&ctx);
+    spu_mfc_release(&ctx);
     return (int32_t)ctx.stop_code;
 }
 
@@ -329,10 +328,8 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
         extern void spu_thread_publish_ctx(uint32_t tid, void* c);
         spu_thread_publish_ctx(opts->spu_id, 0);   /* run over: ctx is a stack local */
     }
-    /* ctx is a stack local that may have taken a lock-line reservation; left
-     * in the reserver set it is walked by the next PPU store to that line.
-     * GH3's Havok task returning is what first hit it. */
     spu_coh_unregister(&ctx);
+    spu_mfc_release(&ctx);
     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
     return 0;
 }
