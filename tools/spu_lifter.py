@@ -339,6 +339,11 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
     return jumps
 
 
+def compute_pc_relative_branches(insns) -> dict:
+    from find_spu_functions import pc_relative_branches
+    return pc_relative_branches(insns)
+
+
 def compute_link_returns(insns, bounds) -> set:
     """A `bi $rN` / conditional `bi{z,nz,hz,hnz} $rC,$rN` with N != 0 is emitted
     as a generic indirect branch, but Sony's SPU compiler also uses a NON-r0
@@ -504,10 +509,16 @@ class SPULifter:
         # compute_link_returns(). Emitted as `return;` so they compose with the
         # brsl->C-call nesting instead of branching to an unregistered PC.
         self.link_return: set = set()
+        self.pc_rel_branch: dict = {}
         self.pic = False
 
     def _la(self, a: int) -> str:
         return f"SPU_PIC(ctx, 0x{a:X})" if self.pic else f"0x{a:X}"
+
+    def _pc_rel_target(self, insn: SPUInstruction):
+        if self.pic or insn.raw & 0x40000:
+            return None
+        return self.pc_rel_branch.get(insn.addr)
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
@@ -522,6 +533,9 @@ class SPULifter:
             tgt = self._branch_target(insn)
             if tgt is not None and start <= tgt < end:
                 internal.add(tgt)
+            pc_rel = self._pc_rel_target(insn)
+            if pc_rel is not None and start <= pc_rel[1] < end:
+                internal.add(pc_rel[1])
 
         last_insn = None
         for insn in insns:
@@ -986,6 +1000,11 @@ class SPULifter:
                 if tgt_reg != "0":
                     return f"if ({cond}) {{ {_ied}SPU_RET_REG(ctx, {tgt_reg}); }}"
                 return f"if ({cond}) {{ {_ied}SPU_RET(ctx); }}"
+            pc_rel = self._pc_rel_target(insn)
+            if pc_rel is not None and func.start_addr <= pc_rel[1] < func.end_addr:
+                return (f"if ({cond}) {{ {_ied}if ({g(tgt_reg)}._u32[0] == 0x{pc_rel[1]:X}u) "
+                        f"goto loc_{pc_rel[1]:08X}; ctx->pc = {g(tgt_reg)}._u32[0]; "
+                        f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
             return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
 
@@ -1277,6 +1296,7 @@ def main() -> None:
               f"(r0 set by lqa/lqr/il/ila, not a link): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.bi_r0_jump))}")
     lifter.link_return = compute_link_returns(insns, bounds)
+    lifter.pc_rel_branch = compute_pc_relative_branches(insns)
     if args.force_indirect:
         forced = {int(x, 0) for x in args.force_indirect.split(",") if x.strip()}
         dropped = lifter.link_return & forced

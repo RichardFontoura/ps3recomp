@@ -24,6 +24,8 @@ Usage:
 import argparse, glob, hashlib, json, os, struct, subprocess, sys
 sys.path.insert(0, os.path.dirname(__file__))
 from wrap_spu_elf import wrap
+from spu_disasm import spu_decode
+from find_spu_functions import is_function_boundary
 
 ROOT   = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 LIFTER = os.path.join(os.path.dirname(__file__), "spu_lifter.py")
@@ -123,6 +125,30 @@ def switch_table_targets(raw, base=BASE):
 
 
 
+def pic_pointer_targets(raw, base=BASE, window=16, body=6):
+    insns_by_addr = {base + off: spu_decode(struct.unpack_from(">I", raw, off)[0], base + off)
+                     for off in range(0, len(raw) - 3, 4)}
+    out = set()
+    for off in range(0x30, len(raw) - 4 * window, 4):
+        w = struct.unpack_from(">I", raw, off)[0]
+        if (w >> 25) & 0x7F != 0x21:
+            continue
+        rt, imm = w & 0x7F, (w >> 7) & 0x3FFFF
+        if rt == 126 or imm % 4 or not 0x30 <= imm < len(raw) - 4 * body:
+            continue
+        for k in range(1, window + 1):
+            w2 = struct.unpack_from(">I", raw, off + 4 * k)[0]
+            if (w2 >> 21) & 0x7FF == 0x0C0 and {(w2 >> 7) & 0x7F, (w2 >> 14) & 0x7F} == {rt, 126}:
+                tgt = base + imm
+                code = all(insns_by_addr[tgt + 4 * j].mnemonic not in ("stop", "stopd", ".word", "???")
+                           for j in range(body))
+                if code and is_function_boundary(tgt, insns_by_addr):
+                    out.add(tgt)
+                break
+    return sorted(out)
+
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -183,6 +209,7 @@ def main():
         inside.append(hex(BASE + 0x30))
         inside += [hex(a) for a in manual_link_targets(raw)]
         inside += [hex(a) for a in switch_table_targets(raw)]
+        inside += [hex(a) for a in pic_pointer_targets(raw)]
         if inside:
             cmd += ["--extra-funcs", ",".join(inside)]
         r = subprocess.run(cmd, capture_output=True, text=True)

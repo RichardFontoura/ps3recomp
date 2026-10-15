@@ -477,6 +477,48 @@ def collect_duff_targets(insns, code_start, code_end, window=12, span=64):
     return targets
 
 
+def pc_relative_branches(insns):
+    out = {}
+    for i in range(2, len(insns)):
+        get, add, br = insns[i - 2], insns[i - 1], insns[i]
+        if br.raw >> 21 not in (0x128, 0x129, 0x12A, 0x12B):
+            continue
+        if add.addr != get.addr + 4 or br.addr != add.addr + 4:
+            continue
+        reg = (br.raw >> 7) & 0x7F
+        if reg == 0 or get.raw >> 23 != 0x066 or get.raw & 0x7F != reg or (get.raw >> 7) & 0xFFFF != 1:
+            continue
+        if add.raw >> 24 != 0x1C or add.raw & 0x7F != reg or (add.raw >> 7) & 0x7F != reg:
+            continue
+        imm = (add.raw >> 14) & 0x3FF
+        if imm & 0x200:
+            imm -= 0x400
+        tgt = add.addr + imm
+        if tgt & 3 == 0 and 0 <= tgt < 0x40000:
+            out[br.addr] = (reg, tgt)
+    return out
+
+
+def collect_interrupt_enable_targets(insns):
+    by_addr = {ins.addr: ins for ins in insns}
+    return {tgt for addr, (_, tgt) in pc_relative_branches(insns).items()
+            if by_addr[addr].raw & 0x40000}
+
+
+def is_function_boundary(addr, insns_by_addr, max_pad=3):
+    prev = addr - 4
+    for _ in range(max_pad):
+        ins = insns_by_addr.get(prev)
+        if ins is None or (ins.raw >> 21) not in (0x001, 0x201):
+            break
+        prev -= 4
+    ins = insns_by_addr.get(prev)
+    if ins is None:
+        return False
+    op11, op9 = ins.raw >> 21, ins.raw >> 23
+    return ins.raw == 0 or op11 in (0x1A8, 0x1AA) or op9 in (0x060, 0x064)
+
+
 def collect_function_pointer_tables(buf, phs, code_start, code_end,
                                     insns_by_addr, min_run=3, max_run=1024):
     """Function-pointer tables that live in DATA, not .text.
@@ -515,7 +557,9 @@ def collect_function_pointer_tables(buf, phs, code_start, code_end,
         skew = (-vaddr) & 3                 # keep words on the LS 4-byte grid
         run = []
         def _flush(r):
-            if len(r) >= min_run and len(set(r)) >= 2:
+            if len(set(r)) < 2:
+                return
+            if len(r) >= min_run or all(is_function_boundary(t, insns_by_addr) for t in r):
                 targets.update(r)
         i = skew
         while i + 4 <= len(seg):
@@ -630,6 +674,7 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
               | collect_jump_table_targets(insns, code, code_start, code_end)
               | collect_ila_continuation_targets(insns, code_start, code_end)
               | collect_duff_targets(insns, code_start, code_end)
+              | collect_interrupt_enable_targets(insns)
               | fptr_targets):
         if code_start <= t < code_end and (t & 3) == 0 and t in insns_by_addr:
             seed_starts.add(t)
