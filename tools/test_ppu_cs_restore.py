@@ -35,3 +35,20 @@ body = "\n".join(func.body_lines)
 assert "uint64_t _cs_23 = vm_read64(ctx->gpr[1] + 0x888);" in body, body
 assert "ctx->gpr[23] = vm_read64(ctx->gpr[1] + 0x918);" in body, body
 print("PASS: second-slot reload stays a real load")
+
+
+def w_std(rs, ra, d):   return (62 << 26) | (rs << 21) | (ra << 16) | (d & 0xFFFC)
+def w_stdu(rs, ra, d):  return (62 << 26) | (rs << 21) | (ra << 16) | (d & 0xFFFC) | 1
+def w_addic(rt, ra, s): return (12 << 26) | (rt << 21) | (ra << 16) | (s & 0xFFFF)
+
+
+words = [w_stdu(1, 1, -272), w_std(24, 1, 208), w_addic(24, 25, 108), w_std(24, 1, 120),
+         w_addi(24, 3, 0), w_ld(24, 1, 120), w_addi(3, 24, 0), w_ld(24, 1, 208),
+         w_addi(1, 1, 272), w_blr()]
+insns = [ppu_disasm.decode(w, BASE + 4 * i) for i, w in enumerate(words)]
+func = PPULifter().lift_function(insns, BASE, BASE + 4 * len(words))
+body = "\n".join(func.body_lines)
+
+assert "ctx->gpr[24] = vm_read64(ctx->gpr[1] + 0x78);" in body, body
+assert "ctx->gpr[24] = _cs_24;" in body, body
+print("PASS: spill of a carry-defined register stays a real reload")

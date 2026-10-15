@@ -389,6 +389,7 @@ _FRAME_ALLOC = "ctx->gpr[1] += -0x"
 # produced by a call DURING the body (an out-param), not held from entry.
 _CS_ADDR_OF_RE = re.compile(
     r'ctx->gpr\[\d+\] = ctx->gpr\[1\] \+ \(int64_t\)\((-?0x[0-9A-Fa-f]+|-?\d+)\);')
+_GPR_DEF_RE = re.compile(r'ctx->gpr\[(\d+)\]\s*(?:[-+*/|&^]|<<|>>)?=(?!=)')
 
 
 _CS_CALL_RE = re.compile(r'\bfunc_[0-9A-Fa-f]+\(ctx\)|ps3_indirect_call|ps3_hle_call')
@@ -776,11 +777,8 @@ class PPULifter:
         # saves that precede it.
         _first_def = {}
         for _i, _l in enumerate(func.body_lines):
-            _dm = re.match(r'\s*ctx->gpr\[(\d+)\] = ', _l)
-            if _dm:
-                _r = int(_dm.group(1))
-                if _r not in _first_def:
-                    _first_def[_r] = _i
+            for _dm in _GPR_DEF_RE.finditer(_l):
+                _first_def.setdefault(int(_dm.group(1)), _i)
         # Stores through a frame POINTER land on frame slots that never appear
         # as a literal `r1 + off` store, so _write_counts misses them and the
         # slot looks untouched. Track registers holding r1+off (through the

@@ -321,35 +321,23 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 
-/* sys_lwcond (sysPrxForUser) — guest-side condition variable, paired with an
- * lwmutex. The CRT and (newly) libsre's cellSpurs create/wait/signal these. Like
- * sys_lwmutex above, model it directly in guest memory so the args stay GUEST
- * EAs (the generic adapter would pass them raw and the C sysPrxForUser impl
- * deref'd them as host pointers -> AV during cellSpurs init). A no-op wait is
- * adequate here: the CRT/SPURS paths that reach us use these for one-shot init
- * handshakes, not long-term blocking. sys_lwcond_t: +0x00 lwmutex EA (be64),
- * +0x08 lwcond_queue id. */
 static void sys_lwcond_create(ppu_context* ctx)
 {
     static uint32_t s_lwcond_id = 0x4C000000u;
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
     uint32_t lwmutex = (uint32_t)ctx->gpr[4];
-    vm_write64(lwcond + 0x00, (uint64_t)lwmutex);
-    vm_write32(lwcond + 0x08, ++s_lwcond_id);
+    vm_write32(lwcond + 0x00, lwmutex);
+    vm_write32(lwcond + 0x04, ++s_lwcond_id);
     ctx->gpr[3] = 0;
 }
 static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
 static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
 static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
 static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
-/* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
- * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
- * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
- * common single (non-recursive) hold. */
 static void sys_lwcond_wait(ppu_context* ctx)
 {
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
-    uint32_t lwmutex = (uint32_t)vm_read64(lwcond + 0x00);
+    uint32_t lwmutex = vm_read32(lwcond + 0x00);
     HANDLE s = lwm_sem(lwmutex);
     if (s) {
         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
