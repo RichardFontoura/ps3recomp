@@ -50,6 +50,7 @@ extern u32 ppu_vm_size;
  * rsx_live_draw.c rejects the same 4096 bound (2033). */
 #define ENG_MAX_TEX_DIM    4096u
 #define ENG_TEX_SAMPLE_MIN (1u << 20)
+#define ENG_MAX_ALIASES    32
 /* A surface declaration beyond this is a guest pointer read as clip
  * dimensions. rsx_live_draw.c's surface-guard (2625) preserves the existing
  * target rather than destroying a live one. */
@@ -124,6 +125,13 @@ typedef struct {
 } eng_texture;
 
 typedef struct {
+    u32 target, depth_bytes, format, width, height, pitch, remap;
+    u32 handle;
+    u64 serial;
+    u64 last_use;
+} eng_alias;
+
+typedef struct {
     u64 key;
     u32 handle;
     u8 fixed;
@@ -156,6 +164,9 @@ static struct {
     u32 n_zdepths;
     eng_texture textures[ENG_MAX_TEXTURES];
     u32 n_textures;
+    eng_alias aliases[ENG_MAX_ALIASES];
+    u32 n_aliases;
+    u64 alias_use;
     eng_pipeline pipelines[ENG_MAX_PIPELINES];
     u32 n_pipelines;
     eng_display_buffer display_buffers[8];
@@ -220,6 +231,8 @@ static struct {
 } dc;
 
 static void eng_texture_reclaim(u64 want);
+static void eng_textures_touch(u32 location, u32 offset, u32 bytes);
+static void eng_surfaces_wrote(const u32* targets, u32 n_targets);
 
 /* ---- guest memory -------------------------------------------------------- */
 
@@ -246,6 +259,12 @@ static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
     if (!ea) return NULL;
     if (ppu_vm_size && (u64)ea + min_bytes > ppu_vm_size) return NULL;
     return vm_base + ea;
+}
+
+static int eng_env_on(const char* name)
+{
+    const char* e = getenv(name);
+    return !e || atoi(e) != 0;
 }
 
 static u64 eng_fnv1a(const void* data, u32 n, u64 hash)
@@ -717,9 +736,16 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
                     location, offset, w, h);
         return;
     }
-    const eng_surface* s = &g.surfaces[slot];
+    eng_surface* s = &g.surfaces[slot];
+    if (!s->guest_dirty) return;
     if (x + w > s->w) w = s->w - x;
     if (y + h > s->h) h = s->h - y;
+    const int whole = y == 0 && h == s->h && s->pitch >= s->w * 4u;
+    if (whole) {
+        offset -= x * 4u;
+        x = 0;
+        w = s->w;
+    }
     u8* rows = eng_coherence_buffer(w * 4u * h);
     if (!rows) return;
     g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
@@ -738,6 +764,32 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
             dst[0] = src[3]; dst[1] = src[0]; dst[2] = src[1]; dst[3] = src[2];
         }
     }
+    if (whole) {
+        s->guest_dirty = 0;
+        eng_textures_touch(s->location, s->offset, s->pitch * s->h);
+    }
+}
+
+int rsx_draw_engine_blit(u32 src_location, u32 src_offset, u32 src_pitch,
+                         u32 dst_location, u32 dst_offset, u32 dst_pitch, u32 w, u32 h)
+{
+    static int on = -1;
+    if (on < 0) on = eng_env_on("RSX_ENGINE_GPU_BLIT");
+    if (!on || !g.ready || !g.be->surface_blit || !w || !h) return 0;
+    u32 sx = 0, sy = 0, dx = 0, dy = 0;
+    const u32 src = eng_surface_at(src_location, src_offset, src_pitch, &sx, &sy);
+    if (src == ENG_INVALID) return 0;
+    const u32 dst = eng_surface_at(dst_location, dst_offset, dst_pitch, &dx, &dy);
+    if (dst == ENG_INVALID || dst == src) return 0;
+    const eng_surface* s = &g.surfaces[src];
+    const eng_surface* d = &g.surfaces[dst];
+    if (sx + w > s->w || sy + h > s->h || dx + w > d->w || dy + h > d->h) return 0;
+    if (!g.be->surface_blit(g.be->user, d->handle, dx, dy, s->handle, sx, sy, w, h)) return 0;
+    eng_surfaces_wrote(&dst, 1);
+    if (eng_coherence_log())
+        fprintf(stderr, "[rsx engine] blit %u:0x%08X -> %u:0x%08X %ux%u on the GPU\n",
+                src_location, src_offset, dst_location, dst_offset, w, h);
+    return 1;
 }
 
 void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
@@ -771,6 +823,7 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, x, y,
                 eng_nonzero_pixels(rows, w * h));
     g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
+    g.surfaces[slot].color_serial = ++g.write_serial;
 }
 
 static u32 eng_current_surface(void)
@@ -1181,6 +1234,74 @@ static int eng_format_reinterprets_rgba8(u32 base_fmt)
     default:
         return 0;
     }
+}
+
+static u32 eng_alias_texture(u32 target, u32 depth_bytes, u32 pitch, u32 rows, u64 serial,
+                             const rsx_dsp_texture* t)
+{
+    if (!g.be->texture_from_target || !target || t->cubemap || t->mipmaps > 1 ||
+        t->pitch != pitch)
+        return 0;
+    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+    if (rsx_texture_mip_chain(t->format, t->width, t->height, 1, t->pitch, lv) != 1) return 0;
+    const rsx_tex_layout* tl = &lv[0].tl;
+    if (tl->swizzled || tl->compressed || !tl->face_bytes ||
+        (u64)tl->face_bytes > (u64)pitch * rows)
+        return 0;
+    const u32 remap = t->remap & 0xFFFFu;
+    eng_alias* e = NULL;
+    for (u32 i = 0; i < g.n_aliases && !e; i++) {
+        eng_alias* a = &g.aliases[i];
+        if (a->handle && a->target == target && a->depth_bytes == depth_bytes &&
+            a->format == t->format && a->width == t->width && a->height == t->height &&
+            a->pitch == pitch && a->remap == remap)
+            e = a;
+    }
+    if (!e) {
+        u32 slot = g.n_aliases;
+        if (slot == ENG_MAX_ALIASES) {
+            slot = 0;
+            for (u32 i = 1; i < g.n_aliases; i++)
+                if (g.aliases[i].last_use < g.aliases[slot].last_use) slot = i;
+            g.be->texture_release(g.be->user, g.aliases[slot].handle);
+        } else {
+            g.n_aliases++;
+        }
+        e = &g.aliases[slot];
+        memset(e, 0, sizeof *e);
+        e->handle = g.be->texture_create(g.be->user, eng_texfmt(tl->fmt), t->width, t->height,
+                                         1, 1, remap, t->format);
+        if (!e->handle) return 0;
+        e->target = target; e->depth_bytes = depth_bytes; e->format = t->format;
+        e->width = t->width; e->height = t->height; e->pitch = pitch; e->remap = remap;
+    }
+    e->last_use = ++g.alias_use;
+    if (!serial || e->serial != serial) {
+        if (!g.be->texture_from_target(g.be->user, e->handle, target, depth_bytes, pitch,
+                                       t->width, t->height, tl))
+            return 0;
+        e->serial = serial;
+    }
+    return e->handle;
+}
+
+static u32 eng_surface_alias(u32 slot, const rsx_dsp_texture* t)
+{
+    static int on = -1;
+    if (on < 0) on = eng_env_on("RSX_ENGINE_GPU_ALIAS");
+    const eng_surface* s = &g.surfaces[slot];
+    if (!on || s->fmt != RSX_BE_FMT_R8G8B8A8) return 0;
+    return eng_alias_texture(s->handle, 0, s->pitch, s->h, s->color_serial, t);
+}
+
+static u32 eng_zdepth_alias(u32 slot, const rsx_dsp_texture* t)
+{
+    static int on = -1;
+    if (on < 0) on = eng_env_on("RSX_ENGINE_GPU_DEPTH_ALIAS");
+    if (!on) return 0;
+    const eng_zdepth* z = &g.zdepths[slot];
+    return eng_alias_texture(z->handle, z->zfmt == 1u ? 2u : 4u, z->pitch, z->h,
+                             z->depth_serial, t);
 }
 
 /* Store a colour surface into guest memory, A,R,G,B per pixel at its own
@@ -1846,18 +1967,24 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             break;
         }
         if (zsrc >= 0) {
-            /* DEPTH24_D8 keeps the backend's own snapshot when it has one;
-             * anything else goes through guest memory. */
             if (base_fmt == RSX_TEX_FMT_DEPTH24_D8 && current_zslot != (u32)zsrc) {
                 const u32 snap = eng_zdepth_snapshot((u32)zsrc);
                 if (snap) { textures[u] = snap; continue; }
             }
+            const u32 alias = eng_zdepth_alias((u32)zsrc, &t);
+            if (alias) { textures[u] = alias; continue; }
             if (eng_zdepth_to_guest((u32)zsrc)) {
                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                                t.width, t.height, t.mipmaps, t.pitch,
                                                (int)t.cubemap, t.remap & 0xFFFFu);
                 continue;
             }
+        }
+        if (sampled >= 0 && zsrc < 0 &&
+            g.surfaces[sampled].fmt == RSX_BE_FMT_R8G8B8A8 &&
+            eng_format_reinterprets_rgba8(base_fmt)) {
+            const u32 alias = eng_surface_alias((u32)sampled, &t);
+            if (alias) { textures[u] = alias; continue; }
         }
         if (sampled >= 0 && zsrc < 0 &&
             g.surfaces[sampled].fmt == RSX_BE_FMT_R8G8B8A8 &&
@@ -2704,6 +2831,8 @@ void rsx_draw_engine_shutdown(void)
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_SHUTDOWN);
     for (u32 i = 0; i < g.n_textures; i++)
         if (g.textures[i].handle) g.be->texture_release(g.be->user, g.textures[i].handle);
+    for (u32 i = 0; i < g.n_aliases; i++)
+        if (g.aliases[i].handle) g.be->texture_release(g.be->user, g.aliases[i].handle);
     for (u32 i = 0; i < g.n_pipelines; i++)
         if (g.pipelines[i].handle) g.be->pipeline_release(g.be->user, g.pipelines[i].handle);
     for (u32 i = 0; i < g.n_surfaces; i++)

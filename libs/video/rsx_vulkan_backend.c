@@ -106,7 +106,9 @@
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
     X(vkCmdSetStencilReference) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
     X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage) \
-    X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData)
+    X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData) \
+    X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) \
+    X(vkGetQueryPoolResults)
 /* Window-system entry points, loaded only when a window was requested, so a
  * headless run never depends on a driver that can present. */
 #define VK_WSI_INSTANCE_FNS(X) \
@@ -203,6 +205,7 @@ typedef struct vk_state {
     int              eng_active;      /* the register-file engine drives us */
     int              bc_ok;           /* textureCompressionBC enabled       */
     u32              max_dim;         /* maxImageDimension2D of the device  */
+    float            ts_period;
     int              windowed;
     SDL_Window*      window;
     const char*      inst_exts[16];
@@ -240,7 +243,7 @@ static vk_state s_vk;
 static struct {
     FILE* csv;
     int   initialized;
-    u64   start_ns, last_ns, wait_ns, submits, staging, draws;
+    u64   start_ns, last_ns, wait_ns, submits, staging, draws, gpu_ns;
 } s_vk_probe;
 
 static struct {
@@ -282,17 +285,27 @@ static struct {
     u32              ops, sets;
     vk_buffer        ring;
     VkDeviceSize     head, ubo_align;
-    VkDescriptorPool pool;
+    VkDescriptorPool pools[2];
     vk_buffer        readback;
     u32              generation;
+    VkCommandBuffer  cmds[2];
+    VkFence          fences[2];
+    int              inflight[2];
+    u32              slot;
+    int              center_pending;
+    u32              center_slot;
+    size_t           center_offset;
+    VkQueryPool      queries;
+    int              timed[2];
 } s_vb;
 
 static struct {
-    int             on, busy, pending, quit;
+    int             on, busy, pending, quit, ready_pending;
     VkQueue         queue;
     VkCommandPool   pool;
     VkCommandBuffer cmd;
     VkFence         fence;
+    VkSemaphore     ready;
     vk_image        img;
     SDL_Thread*     thread;
     SDL_mutex*      lock;
@@ -457,6 +470,7 @@ static int vk_pick_device(void)
     /* Vulkan guarantees 4096; the engine's targets and textures may use what
      * the device really has (a title's 4608-wide target on RADV). */
     s_vk.max_dim = p.limits.maxImageDimension2D >= 4096u ? p.limits.maxImageDimension2D : 4096u;
+    s_vk.ts_period = p.limits.timestampPeriod;
     snprintf(s_vk.device_name, sizeof s_vk.device_name, "%s", p.deviceName);
     VK_LOG("using device %d: %s\n", best, p.deviceName);
     return 0;
@@ -531,9 +545,14 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
     return vk_create_image_levels(im, fmt, w, h, 1, usage, aspect);
 }
 
+static int vk_gpu_busy(void)
+{
+    return s_vb.recording || s_vb.inflight[0] || s_vb.inflight[1];
+}
+
 static void vk_destroy_image(vk_image* im)
 {
-    if (s_vb.recording && (im->img || im->view)) vk_flush();
+    if (vk_gpu_busy() && (im->img || im->view)) vk_flush();
     if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
     if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
     if (im->mem) {
@@ -579,7 +598,7 @@ static int vk_create_host_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsageF
 
 static void vk_destroy_buffer(vk_buffer* b)
 {
-    if (s_vb.recording && b->buf) vk_flush();
+    if (vk_gpu_busy() && b->buf) vk_flush();
     if (b->ptr) pvkUnmapMemory(s_vk.device, b->mem);
     if (b->buf) pvkDestroyBuffer(s_vk.device, b->buf, NULL);
     if (b->mem) pvkFreeMemory(s_vk.device, b->mem, NULL);
@@ -616,7 +635,7 @@ static void vk_probe_init(void)
     s_vk_probe.start_ns = s_vk_probe.last_ns = vk_probe_now();
     if (s_vk_probe.csv)
         fputs("frame,elapsed_ms,frame_ms,submit_wait_ms,submits,present_ms,guest_flip,staging,draws,"
-              "shader_ms\n", s_vk_probe.csv);
+              "shader_ms,gpu_ms\n", s_vk_probe.csv);
     const char* every = getenv("RSX_VK_SHADER_STATS");
     s_sst.print_every_s = (every && atoi(every) > 0) ? (u32)atoi(every) : 0;
     s_sst.next_print_ns = s_vk_probe.start_ns + (u64)s_sst.print_every_s * 1000000000ull;
@@ -663,15 +682,16 @@ static void vk_probe_frame(u64 present_start)
     vk_sc_tick();
     if (!s_vk_probe.csv) return;
     const u64 now = vk_probe_now();
-    fprintf(s_vk_probe.csv, "%u,%.6f,%.6f,%.6f,%llu,%.6f,%u,%llu,%llu,%.6f\n", s_vk.presented,
+    fprintf(s_vk_probe.csv, "%u,%.6f,%.6f,%.6f,%llu,%.6f,%u,%llu,%llu,%.6f,%.6f\n", s_vk.presented,
             (now - s_vk_probe.start_ns) / 1e6, (now - s_vk_probe.last_ns) / 1e6,
             s_vk_probe.wait_ns / 1e6, (unsigned long long)s_vk_probe.submits,
             (now - present_start) / 1e6, cellGcm_flip_request_count(),
             (unsigned long long)s_vk_probe.staging, (unsigned long long)s_vk_probe.draws,
-            frame_shader_ns / 1e6);
+            frame_shader_ns / 1e6, s_vk_probe.gpu_ns / 1e6);
     fflush(s_vk_probe.csv);
     s_vk_probe.last_ns = now;
     s_vk_probe.wait_ns = s_vk_probe.submits = s_vk_probe.staging = s_vk_probe.draws = 0;
+    s_vk_probe.gpu_ns = 0;
 }
 
 static int vk_begin(void)
@@ -684,31 +704,97 @@ static int vk_begin(void)
     VK_CHECK(pvkBeginCommandBuffer(s_vk.cmd, &bi), "vkBeginCommandBuffer");
     s_vb.recording = 1;
     s_vb.ops = 0;
+    if (s_vb.queries) {
+        pvkCmdResetQueryPool(s_vk.cmd, s_vb.queries, s_vb.slot * 2u, 2);
+        pvkCmdWriteTimestamp(s_vk.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s_vb.queries, s_vb.slot * 2u);
+        s_vb.timed[s_vb.slot] = 1;
+    }
     return 0;
+}
+
+static VkDeviceSize vk_batch_base(void)
+{
+    return s_vb.cmds[1] ? (VkDeviceSize)s_vb.slot * (s_vb.ring.size / 2u) : 0;
+}
+
+static VkDeviceSize vk_batch_end(void)
+{
+    return s_vb.cmds[1] ? vk_batch_base() + s_vb.ring.size / 2u : s_vb.ring.size;
 }
 
 static void vk_batch_retire(void)
 {
     s_vb.generation++;
-    s_vb.head = 0;
+    s_vb.head = vk_batch_base();
     s_vb.sets = 0;
-    if (s_vb.pool) pvkResetDescriptorPool(s_vk.device, s_vb.pool, 0);
+    if (s_vb.pools[s_vb.slot]) pvkResetDescriptorPool(s_vk.device, s_vb.pools[s_vb.slot], 0);
+}
+
+static void vk_wait_slot(u32 k)
+{
+    if (!s_vb.inflight[k]) return;
+    pvkWaitForFences(s_vk.device, 1, &s_vb.fences[k], VK_TRUE, UINT64_MAX);
+    s_vb.inflight[k] = 0;
+    if (s_vb.queries && s_vb.timed[k]) {
+        u64 ts[2];
+        if (pvkGetQueryPoolResults(s_vk.device, s_vb.queries, k * 2u, 2, sizeof ts, ts, sizeof ts[0],
+                                   VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] > ts[0])
+            s_vk_probe.gpu_ns += (u64)((double)(ts[1] - ts[0]) * s_vk.ts_period);
+        s_vb.timed[k] = 0;
+    }
+    if (s_vb.center_pending && s_vb.center_slot == k) {
+        s_vb.center_pending = 0;
+        vk_invalidate(&s_vk.readback);
+        const unsigned char* px = (const unsigned char*)s_vk.readback.ptr + s_vb.center_offset;
+        s_vk.last_center = ((u32)px[0] << 16) | ((u32)px[1] << 8) | (u32)px[2];
+    }
+}
+
+static int vk_submit_current(VkSemaphore signal)
+{
+    s_vb.recording = 0;
+    if (s_vb.queries && s_vb.timed[s_vb.slot])
+        pvkCmdWriteTimestamp(s_vk.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_vb.queries,
+                             s_vb.slot * 2u + 1u);
+    VK_CHECK(pvkEndCommandBuffer(s_vk.cmd), "vkEndCommandBuffer");
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd,
+                        .signalSemaphoreCount = signal ? 1u : 0u, .pSignalSemaphores = &signal };
+    VK_CHECK(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences");
+    VK_CHECK(pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence), "vkQueueSubmit");
+    if (s_vb.fences[0]) s_vb.inflight[s_vb.slot] = 1;
+    else VK_CHECK(pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    return 0;
 }
 
 static int vk_flush(void)
 {
-    if (!s_vb.recording) return 0;
-    s_vb.recording = 0;
+    const int recording = s_vb.recording;
+    if (!recording && !s_vb.inflight[0] && !s_vb.inflight[1]) return 0;
     ps3_timeline(PS3_TL_GPU_FLUSH_BEGIN, s_vb.ops);
     const u64 t0 = s_vk_probe.csv ? vk_probe_now() : 0;
-    VK_CHECK(pvkEndCommandBuffer(s_vk.cmd), "vkEndCommandBuffer");
-    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                        .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
-    VK_CHECK(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences");
-    VK_CHECK(pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence), "vkQueueSubmit");
-    VK_CHECK(pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-    if (s_vk_probe.csv) { s_vk_probe.wait_ns += vk_probe_now() - t0; s_vk_probe.submits++; }
+    if (recording && vk_submit_current(VK_NULL_HANDLE)) return -1;
+    vk_wait_slot(s_vb.slot ^ 1u);
+    vk_wait_slot(s_vb.slot);
+    if (s_vk_probe.csv) { s_vk_probe.wait_ns += vk_probe_now() - t0; s_vk_probe.submits += (u64)recording; }
+    if (recording) vk_batch_retire();
+    ps3_timeline(PS3_TL_GPU_FLUSH_END, 0);
+    return 0;
+}
+
+static int vk_submit_async(VkSemaphore signal)
+{
+    if (!s_vb.cmds[1]) return vk_flush();
+    if (!s_vb.recording) return 0;
+    ps3_timeline(PS3_TL_GPU_FLUSH_BEGIN, s_vb.ops);
+    const u64 t0 = s_vk_probe.csv ? vk_probe_now() : 0;
+    if (vk_submit_current(signal)) return -1;
+    s_vb.slot ^= 1u;
+    s_vk.cmd = s_vb.cmds[s_vb.slot];
+    s_vk.fence = s_vb.fences[s_vb.slot];
+    vk_wait_slot(s_vb.slot);
     vk_batch_retire();
+    if (s_vk_probe.csv) { s_vk_probe.wait_ns += vk_probe_now() - t0; s_vk_probe.submits++; }
     ps3_timeline(PS3_TL_GPU_FLUSH_END, 0);
     return 0;
 }
@@ -720,7 +806,7 @@ static int vk_submit_and_wait(void)
 
 static int vk_end_op(void)
 {
-    if (++s_vb.ops >= VK_BATCH_MAX_OPS) return vk_flush();
+    if (++s_vb.ops >= VK_BATCH_MAX_OPS) return vk_submit_async(VK_NULL_HANDLE);
     return 0;
 }
 
@@ -747,8 +833,10 @@ static int vk_batch_reserve(VkDeviceSize bytes, u32 sets)
 {
     if (vk_batch_ring()) return -1;
     const VkDeviceSize need = bytes + 8u * s_vb.ubo_align;
-    if (need > s_vb.ring.size) return -1;
-    if (s_vb.head + need > s_vb.ring.size || s_vb.sets + sets > VK_BATCH_SETS) vk_flush();
+    if (s_vb.head < vk_batch_base()) s_vb.head = vk_batch_base();
+    if (need > vk_batch_end() - vk_batch_base()) return -1;
+    if (s_vb.head + need > vk_batch_end() || s_vb.sets + sets > VK_BATCH_SETS)
+        vk_submit_async(VK_NULL_HANDLE);
     return 0;
 }
 
@@ -762,7 +850,8 @@ static VkDeviceSize vk_batch_alloc(VkDeviceSize bytes, VkDeviceSize align, void*
 
 static VkDescriptorSet vk_batch_set(VkDescriptorSetLayout layout)
 {
-    if (!s_vb.pool) {
+    VkDescriptorPool* pool = &s_vb.pools[s_vb.slot];
+    if (!*pool) {
         VkDescriptorPoolSize ps[3] = {
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2u * VK_BATCH_SETS },
             { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, RSX_MAX_TEXTURES * VK_BATCH_SETS },
@@ -770,13 +859,13 @@ static VkDescriptorSet vk_batch_set(VkDescriptorSetLayout layout)
         };
         VkDescriptorPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
                                            .maxSets = VK_BATCH_SETS, .poolSizeCount = 3, .pPoolSizes = ps };
-        if (pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &s_vb.pool) != VK_SUCCESS) {
-            s_vb.pool = VK_NULL_HANDLE;
+        if (pvkCreateDescriptorPool(s_vk.device, &pci, NULL, pool) != VK_SUCCESS) {
+            *pool = VK_NULL_HANDLE;
             return VK_NULL_HANDLE;
         }
     }
     VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                                        .descriptorPool = s_vb.pool, .descriptorSetCount = 1,
+                                        .descriptorPool = *pool, .descriptorSetCount = 1,
                                         .pSetLayouts = &layout };
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (pvkAllocateDescriptorSets(s_vk.device, &dai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
@@ -2200,7 +2289,9 @@ static int vk_async_present_thread(void* unused)
         SDL_LockMutex(s_vp.lock);
         while (!s_vp.pending && !s_vp.quit) SDL_CondWait(s_vp.wake, s_vp.lock);
         const int quit = s_vp.quit;
+        const int ready = s_vp.ready_pending;
         s_vp.pending = 0;
+        s_vp.ready_pending = 0;
         SDL_UnlockMutex(s_vp.lock);
         if (quit) return 0;
         if (__atomic_load_n(&s_vk.sc_dirty, __ATOMIC_ACQUIRE) && s_vk.swapchain) {
@@ -2249,11 +2340,13 @@ static int vk_async_present_thread(void* unused)
                                       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &b);
             }
             pvkEndCommandBuffer(s_vp.cmd);
-            VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            const VkPipelineStageFlags wait_stages[2] = { VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                          VK_PIPELINE_STAGE_TRANSFER_BIT };
+            const VkSemaphore waits[2] = { s_vk.sem_acquire, s_vp.ready };
             VkSubmitInfo si = {
                 .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                .waitSemaphoreCount = 1, .pWaitSemaphores = &s_vk.sem_acquire,
-                .pWaitDstStageMask = &wait_stage,
+                .waitSemaphoreCount = ready ? 2u : 1u, .pWaitSemaphores = waits,
+                .pWaitDstStageMask = wait_stages,
                 .commandBufferCount = 1, .pCommandBuffers = &s_vp.cmd,
                 .signalSemaphoreCount = 1, .pSignalSemaphores = &s_vk.sc_done[idx],
             };
@@ -2262,6 +2355,15 @@ static int vk_async_present_thread(void* unused)
                 pvkWaitForFences(s_vk.device, 1, &s_vp.fence, VK_TRUE, UINT64_MAX);
                 submitted = 1;
             }
+        }
+        if (!submitted && ready) {
+            const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            VkSubmitInfo drain = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                                   .waitSemaphoreCount = 1, .pWaitSemaphores = &s_vp.ready,
+                                   .pWaitDstStageMask = &stage };
+            pvkResetFences(s_vk.device, 1, &s_vp.fence);
+            if (pvkQueueSubmit(s_vp.queue, 1, &drain, s_vp.fence) == VK_SUCCESS)
+                pvkWaitForFences(s_vk.device, 1, &s_vp.fence, VK_TRUE, UINT64_MAX);
         }
         SDL_LockMutex(s_vp.lock);
         s_vp.busy = 0;
@@ -2291,8 +2393,10 @@ static int vk_async_present_start(void)
                                         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
                                         .commandBufferCount = 1 };
     VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkSemaphoreCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
     if (pvkAllocateCommandBuffers(s_vk.device, &cai, &s_vp.cmd) != VK_SUCCESS ||
         pvkCreateFence(s_vk.device, &fci, NULL, &s_vp.fence) != VK_SUCCESS ||
+        pvkCreateSemaphore(s_vk.device, &sci, NULL, &s_vp.ready) != VK_SUCCESS ||
         vk_create_image(&s_vp.img, VK_FORMAT_R8G8B8A8_UNORM, s_vk.width, s_vk.height,
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                         VK_IMAGE_ASPECT_COLOR_BIT) ||
@@ -2324,6 +2428,7 @@ static void vk_async_present_stop(void)
     if (s_vp.lock) SDL_DestroyMutex(s_vp.lock);
     if (s_vk.device) {
         if (s_vp.fence) pvkDestroyFence(s_vk.device, s_vp.fence, NULL);
+        if (s_vp.ready) pvkDestroySemaphore(s_vk.device, s_vp.ready, NULL);
         if (s_vp.pool) pvkDestroyCommandPool(s_vk.device, s_vp.pool, NULL);
         vk_destroy_image(&s_vp.img);
     }
@@ -2340,10 +2445,11 @@ static int vk_async_present_claim(void)
     return claim;
 }
 
-static void vk_async_present_hand_off(void)
+static void vk_async_present_hand_off(int ready)
 {
     SDL_LockMutex(s_vp.lock);
     s_vp.pending = 1;
+    s_vp.ready_pending = ready;
     SDL_CondSignal(s_vp.wake);
     SDL_UnlockMutex(s_vp.lock);
 }
@@ -2400,16 +2506,25 @@ static void vk_cb_present(void* ud, u32 buffer_id)
         pvkCmdBlitImage(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
                         s_vp.img.img, VK_IMAGE_LAYOUT_GENERAL, 1, &copy, VK_FILTER_NEAREST);
     }
-    if (vk_submit_and_wait()) return;
-
-    vk_invalidate(&s_vk.readback);
-    const unsigned char* px = (const unsigned char*)s_vk.readback.ptr;
-    s_vk.last_center = ((u32)px[c] << 16) | ((u32)px[c + 1] << 8) | (u32)px[c + 2];
+    const int async = s_vb.cmds[1] && !dump_due;
+    if (async) {
+        const u32 slot = s_vb.slot;
+        if (vk_submit_async(handoff ? s_vp.ready : VK_NULL_HANDLE)) return;
+        s_vb.center_pending = 1;
+        s_vb.center_slot = slot;
+        s_vb.center_offset = c;
+    } else {
+        if (handoff && s_vb.cmds[1] && vk_submit_async(s_vp.ready)) return;
+        if (vk_submit_and_wait()) return;
+        vk_invalidate(&s_vk.readback);
+        const unsigned char* px = (const unsigned char*)s_vk.readback.ptr;
+        s_vk.last_center = ((u32)px[c] << 16) | ((u32)px[c + 1] << 8) | (u32)px[c + 2];
+        if (dump_due) vk_dump_ppm(px);
+    }
     s_vk.presented++;
     s_g.last_draws = s_g.draws;
     s_g.draws = 0;
-    if (dump_due) vk_dump_ppm(px);
-    if (handoff) vk_async_present_hand_off();
+    if (handoff) vk_async_present_hand_off(s_vb.cmds[1] != VK_NULL_HANDLE);
     else if (!s_vp.thread) vk_present_window();
     ps3_timeline(PS3_TL_PRESENT, s_vk.presented);
     vk_probe_frame(probe_t0);
@@ -2909,6 +3024,26 @@ static void vk_eng_surface_copy(void* user, u32 dst_surface, u32 src_surface, u3
     vk_end_op();
 }
 
+static int vk_eng_surface_blit(void* user, u32 dst_surface, u32 dx, u32 dy, u32 src_surface,
+                               u32 sx, u32 sy, u32 w, u32 h)
+{
+    (void)user;
+    vk_eng_obj* d = vk_eng_get(dst_surface, VK_ENG_COLOR);
+    vk_eng_obj* s = vk_eng_get(src_surface, VK_ENG_COLOR);
+    if (!d || !s || d == s || d->fmt != s->fmt || !w || !h ||
+        sx + w > s->w || sy + h > s->h || dx + w > d->w || dy + h > d->h || vk_begin())
+        return 0;
+    vk_barrier_image(s->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(d->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    VkImageCopy c = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                      .srcOffset = { (int32_t)sx, (int32_t)sy, 0 },
+                      .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                      .dstOffset = { (int32_t)dx, (int32_t)dy, 0 },
+                      .extent = { w, h, 1 } };
+    pvkCmdCopyImage(s_vk.cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL, d->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    return vk_end_op() == 0;
+}
+
 static void vk_eng_present(void* user, u32 surface)
 {
     (void)user;
@@ -3094,6 +3229,64 @@ static int vk_eng_texture_upload_guest(void* user, u32 texture, u32 face, u32 mi
     }
     return vk_eng_upload_rows(o->im.img, face, mip, w, h, tl->dst_row_bytes,
                                tl->rows, src, tl->row_bytes) == 0 ? 1 : -1;
+}
+
+static int vk_target_convert(u32 target, u32 depth_bytes, u32 pitch, u32 w, u32 h,
+                             const rsx_tex_layout* tl, u32 format, VkDeviceSize* output)
+{
+    vk_eng_obj* t = vk_eng_get(target, depth_bytes ? VK_ENG_DEPTH : VK_ENG_COLOR);
+    const u32 unit = depth_bytes ? depth_bytes : 4u;
+    if (!t || !tl || tl->compressed || tl->swizzled || !w || !h || !pitch || pitch % unit)
+        return 0;
+    if (depth_bytes ? (s_vk.depth_format != VK_FORMAT_D32_SFLOAT &&
+                       s_vk.depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT)
+                    : t->fmt != VK_FORMAT_R8G8B8A8_UNORM)
+        return 0;
+    const u32 row_texels = pitch / unit;
+    const u32 rows = (tl->face_bytes + pitch - 1u) / pitch;
+    if (!rows || rows > t->h || !vk_texture_compute_init()) return 0;
+    const u32 copy_w = row_texels < t->w ? row_texels : t->w;
+    const VkDeviceSize src_bytes = ((VkDeviceSize)row_texels * 4u * rows + 15u) & ~15ull;
+    const VkDeviceSize dst_bytes = ((VkDeviceSize)tl->dst_row_bytes * tl->rows + 15u) & ~15ull;
+    if (vk_batch_reserve(src_bytes + dst_bytes, 0)) return 0;
+    void* p;
+    const VkDeviceSize input = vk_batch_alloc(src_bytes, 16, &p);
+    *output = vk_batch_alloc(dst_bytes, 16, &p);
+    if (vk_begin()) return 0;
+    vk_barrier_image(t->im.img, depth_bytes ? s_vk.depth_aspect : VK_IMAGE_ASPECT_COLOR_BIT,
+                     VK_IMAGE_LAYOUT_GENERAL);
+    VkBufferImageCopy out = { .bufferOffset = input, .bufferRowLength = row_texels,
+        .imageSubresource = { depth_bytes ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT,
+                              0, 0, 1 },
+        .imageExtent = { copy_w, rows, 1 } };
+    pvkCmdCopyImageToBuffer(s_vk.cmd, t->im.img, VK_IMAGE_LAYOUT_GENERAL, s_vb.ring.buf, 1, &out);
+    VkBufferMemoryBarrier bb = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = s_vb.ring.buf, .offset = input, .size = src_bytes };
+    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          0, 0, NULL, 1, &bb, 0, NULL);
+    vk_texture_compute_dispatch(input, *output, dst_bytes, w, h, pitch, tl, format,
+                                depth_bytes == 4u ? 2u : depth_bytes == 2u ? 3u : 1u);
+    return 1;
+}
+
+static int vk_eng_texture_from_target(void* user, u32 texture, u32 target, u32 depth_bytes,
+                                      u32 pitch, u32 w, u32 h, const rsx_tex_layout* tl)
+{
+    (void)user;
+    vk_eng_obj* o = vk_eng_get(texture, VK_ENG_TEXTURE);
+    VkDeviceSize output;
+    if (!o || o->cube || w > o->w || h > o->h ||
+        !vk_target_convert(target, depth_bytes, pitch, w, h, tl,
+                           o->raw_argb ? 0u : tl->base_format, &output))
+        return 0;
+    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    VkBufferImageCopy in = { .bufferOffset = output,
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { w, h, 1 } };
+    pvkCmdCopyBufferToImage(s_vk.cmd, s_vb.ring.buf, o->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
+    return vk_end_op() == 0;
 }
 
 /* A colour target sampled with a unit's crossbar: an extra view of the same
@@ -3304,7 +3497,7 @@ static u32 s_esamp_count;
 
 static void vk_eng_drop_framebuffers(void)
 {
-    if (s_vb.recording && s_e2.fb_count) vk_flush();
+    if (vk_gpu_busy() && s_e2.fb_count) vk_flush();
     for (u32 i = 0; i < s_e2.fb_count; i++)
         if (s_e2.fb[i].fb) pvkDestroyFramebuffer(s_vk.device, s_e2.fb[i].fb, NULL);
     s_e2.fb_count = 0;
@@ -4296,6 +4489,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .submit_and_wait      = vk_eng_submit_and_wait,
     .texture_create       = vk_eng_texture_create,
     .texture_upload_guest = vk_eng_texture_upload_guest,
+    .texture_from_target  = vk_eng_texture_from_target,
     .texture_upload       = vk_eng_texture_upload,
     .texture_release      = vk_eng_release,
     .color_target_create  = vk_eng_color_target_create,
@@ -4322,6 +4516,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .clear_depth_stencil_rect = vk_eng_clear_depth_stencil_rect,
     .surface_region       = vk_eng_surface_region,
     .surface_copy         = vk_eng_surface_copy,
+    .surface_blit         = vk_eng_surface_blit,
     .present              = vk_eng_present,
     .readback             = vk_eng_readback,
     .depth_readback       = vk_eng_depth_readback,
@@ -4435,10 +4630,28 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
                                         .commandPool = s_vk.pool,
                                         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                                        .commandBufferCount = 1 };
-    VK_CHECK(pvkAllocateCommandBuffers(s_vk.device, &cai, &s_vk.cmd), "vkAllocateCommandBuffers");
+                                        .commandBufferCount = 2 };
+    VK_CHECK(pvkAllocateCommandBuffers(s_vk.device, &cai, s_vb.cmds), "vkAllocateCommandBuffers");
     VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    VK_CHECK(pvkCreateFence(s_vk.device, &fci, NULL, &s_vk.fence), "vkCreateFence");
+    VK_CHECK(pvkCreateFence(s_vk.device, &fci, NULL, &s_vb.fences[0]), "vkCreateFence");
+    VK_CHECK(pvkCreateFence(s_vk.device, &fci, NULL, &s_vb.fences[1]), "vkCreateFence");
+    {
+        const char* e = getenv("RSX_VK_ASYNC_SUBMIT");
+        if (e && !atoi(e)) s_vb.cmds[1] = VK_NULL_HANDLE;
+    }
+    s_vk.cmd = s_vb.cmds[0];
+    s_vk.fence = s_vb.fences[0];
+    {
+        const char* e = getenv("RSX_VK_GPU_TIMING");
+        if (e && atoi(e) && s_vk.ts_period > 0.0f) {
+            VkQueryPoolCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                                          .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 4 };
+            if (pvkCreateQueryPool(s_vk.device, &qci, NULL, &s_vb.queries) != VK_SUCCESS)
+                s_vb.queries = VK_NULL_HANDLE;
+            else
+                VK_LOG("GPU time per batch: on (gpu_ms in RSX_FRAME_CSV)\n");
+        }
+    }
 
     if (vk_pick_depth_format()) return -1;
     if (vk_create_image(&s_vk.color, VK_FORMAT_R8G8B8A8_UNORM, s_vk.width, s_vk.height,
@@ -4540,7 +4753,12 @@ void rsx_vulkan_backend_shutdown(void)
         vk_guest_shutdown();
         vk_destroy_buffer(&s_vb.ring);
         vk_destroy_buffer(&s_vb.readback);
-        if (s_vb.pool) pvkDestroyDescriptorPool(s_vk.device, s_vb.pool, NULL);
+        for (u32 k = 0; k < 2; k++)
+            if (s_vb.pools[k]) pvkDestroyDescriptorPool(s_vk.device, s_vb.pools[k], NULL);
+        for (u32 k = 0; k < 2; k++)
+            if (s_vb.fences[k] && s_vb.fences[k] != s_vk.fence)
+                pvkDestroyFence(s_vk.device, s_vb.fences[k], NULL);
+        if (s_vb.queries) pvkDestroyQueryPool(s_vk.device, s_vb.queries, NULL);
         memset(&s_vb, 0, sizeof s_vb);
         for (int i = 0; i < VK_PIPELINE_SLOTS; i++)
             if (s_vk.pipelines[i]) pvkDestroyPipeline(s_vk.device, s_vk.pipelines[i], NULL);

@@ -2,10 +2,24 @@
 layout(local_size_x = 64) in;
 layout(set = 0, binding = 0, std430) buffer Ring { uint data[]; } ring;
 layout(push_constant) uniform Params {
-    uint src, dst, width, height, pitch, sbpp, dbpp, format, swizzled, rgba;
+    uint src, dst, width, height, pitch, sbpp, dbpp, format, swizzled, rgba, source;
 } p;
 
+uint depth_byte(uint offset, uint bytes) {
+    float d = uintBitsToFloat(ring.data[p.src + offset / bytes]);
+    d = d > 0.0 ? min(d, 1.0) : 0.0;
+    uint k = offset % bytes;
+    if (bytes == 2) {
+        uint v = uint(d * 65535.0 + 0.5);
+        return k == 0 ? (v >> 8) & 255 : v & 255;
+    }
+    uint v = uint(d * 16777215.0 + 0.5);
+    return k == 3 ? 0 : (v >> (16 - 8 * k)) & 255;
+}
 uint byte_at(uint offset) {
+    if (p.source == 2) return depth_byte(offset, 4);
+    if (p.source == 3) return depth_byte(offset, 2);
+    if (p.source == 1 && p.rgba == 0) offset = (offset & ~3u) | ((offset + 3) & 3);
     return (ring.data[p.src + offset / 4] >> ((offset & 3) * 8)) & 255;
 }
 uint address(uint pixel) {

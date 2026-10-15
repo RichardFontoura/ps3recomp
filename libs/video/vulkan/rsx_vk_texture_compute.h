@@ -51,7 +51,7 @@ static int vk_texture_compute_init(void)
         .dstSet = s_tc.set, .dstBinding = 0, .descriptorCount = 1,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi };
     pvkUpdateDescriptorSets(s_vk.device, 1, &write, 0, NULL);
-    VkPushConstantRange push = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 10 * sizeof(u32) };
+    VkPushConstantRange push = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 11 * sizeof(u32) };
     VkPipelineLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = &s_tc.set_layout,
         .pushConstantRangeCount = 1, .pPushConstantRanges = &push };
@@ -76,6 +76,28 @@ fail:
     return 0;
 }
 
+static void vk_texture_compute_dispatch(VkDeviceSize input, VkDeviceSize output, VkDeviceSize dst_bytes,
+                                        u32 w, u32 h, u32 pitch, const rsx_tex_layout* tl,
+                                        u32 format, u32 source)
+{
+    u32 push[11] = { (u32)(input / 4), (u32)(output / 4), w, h, pitch,
+        tl->bytes_per_texel, tl->dst_bytes_per_texel, format,
+        tl->swizzled, (u32)rsx_texture_argb_is_rgba(), source };
+    pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_tc.pipeline);
+    pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_tc.layout,
+        0, 1, &s_tc.set, 0, NULL);
+    pvkCmdPushConstants(s_vk.cmd, s_tc.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
+    const u32 groups = (u32)((dst_bytes + 255u) / 256u);
+    const u32 gx = groups > 65535u ? 65535u : groups;
+    pvkCmdDispatch(s_vk.cmd, gx, (groups + gx - 1u) / gx, 1);
+    VkBufferMemoryBarrier barrier = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = s_vb.ring.buf, .offset = output, .size = dst_bytes };
+    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, NULL, 1, &barrier, 0, NULL);
+}
+
 static int vk_texture_compute(const u8* src, u32 w, u32 h, const rsx_tex_layout* tl,
                                VkDeviceSize* output)
 {
@@ -89,21 +111,7 @@ static int vk_texture_compute(const u8* src, u32 w, u32 h, const rsx_tex_layout*
     memcpy(in, src, tl->face_bytes);
     memset((u8*)in + tl->face_bytes, 0, (size_t)(src_bytes - tl->face_bytes));
     if (vk_begin()) return -1;
-    u32 push[10] = { (u32)(input / 4), (u32)(*output / 4), w, h, tl->row_bytes,
-        tl->bytes_per_texel, tl->dst_bytes_per_texel, tl->base_format,
-        tl->swizzled, (u32)rsx_texture_argb_is_rgba() };
-    pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_tc.pipeline);
-    pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_tc.layout,
-        0, 1, &s_tc.set, 0, NULL);
-    pvkCmdPushConstants(s_vk.cmd, s_tc.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
-    const u32 groups = (u32)((dst_bytes + 255u) / 256u);
-    const u32 gx = groups > 65535u ? 65535u : groups;
-    pvkCmdDispatch(s_vk.cmd, gx, (groups + gx - 1u) / gx, 1);
-    VkBufferMemoryBarrier barrier = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = s_vb.ring.buf, .offset = *output, .size = dst_bytes };
-    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, NULL, 1, &barrier, 0, NULL);
+    vk_texture_compute_dispatch(input, *output, dst_bytes, w, h, tl->row_bytes, tl,
+                                tl->base_format, 0);
     return 1;
 }

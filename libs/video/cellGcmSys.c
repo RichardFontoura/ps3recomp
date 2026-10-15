@@ -1117,17 +1117,25 @@ static void nv3089_blit(void)
     u32 dbpp = (s_gcm2d.color_fmt == 4u /* R5G6B5 */) ? 2u
              : (s_gcm2d.color_fmt == 1u /* Y8 */)     ? 1u : 4u;
     u32 bpp = (sbpp == dbpp) ? sbpp : 4u;
-    if (bpp == 4) nv3089_engine_read(in_pitch, out_w, out_h);
     const u32 fx0 = out_x > cx0 ? out_x : cx0, fy0 = out_y > cy0 ? out_y : cy0;
     const u32 fx1 = (out_x + out_w < cx1) ? out_x + out_w : cx1;
     const u32 fy1 = (out_y + out_h < cy1) ? out_y + out_h : cy1;
+    const int on_gpu = bpp == 4 && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
+        fx1 > fx0 && fy1 > fy0 && rsx_draw_engine_enabled() &&
+        rsx_draw_engine_blit(src_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN,
+                             s_nv3089.in_off + ((v0 >> 4) + fy0 - out_y) * in_pitch +
+                                 ((u0 >> 4) + fx0 - out_x) * 4u, in_pitch,
+                             dst_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN,
+                             s_gcm2d.dst_offset + fy0 * dst_pitch + fx0 * 4u, dst_pitch,
+                             fx1 - fx0, fy1 - fy0);
+    if (bpp == 4 && !on_gpu) nv3089_engine_read(in_pitch, out_w, out_h);
     if (s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u && fx1 > fx0 && fy1 > fy0 &&
         nv3089_copy_unscaled(src + (u32)(((u64)v0 << 8) >> 20) * in_pitch + (u32)(((u64)u0 << 8) >> 20) * bpp +
                                  (fy0 - out_y) * in_pitch +
                                  (fx0 - out_x) * bpp,
                              dst + fy0 * dst_pitch + fx0 * bpp, in_pitch, dst_pitch,
                              (fx1 - fx0) * bpp, fy1 - fy0)) {
-        if (bpp == 4) nv3089_engine_wrote(dst_pitch, fx0, fy0, fx1, fy1);
+        if (bpp == 4 && !on_gpu) nv3089_engine_wrote(dst_pitch, fx0, fy0, fx1, fy1);
         return;
     }
     for (u32 y = 0; y < out_h; y++) {
@@ -1149,7 +1157,7 @@ static void nv3089_blit(void)
             else               vm_write8(d, vm_read8(s));
         }
     }
-    if (bpp == 4) {
+    if (bpp == 4 && !on_gpu) {
         const u32 x0 = out_x > cx0 ? out_x : cx0, y0 = out_y > cy0 ? out_y : cy0;
         const u32 x1 = (out_x + out_w < cx1) ? out_x + out_w : cx1;
         const u32 y1 = (out_y + out_h < cy1) ? out_y + out_h : cy1;

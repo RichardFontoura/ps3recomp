@@ -114,6 +114,69 @@ int main(int argc, char** argv)
             cpu_ms, (vk_probe_now() - start) / (1e6 * n));
         free(src); free(dst);
     }
+    {
+        REQUIRE(vk_pick_depth_format() == 0);
+        const int rgba_mode = rsx_texture_argb_is_rgba();
+        u8 rgba[32 * 10 * 4], guest[32 * 10 * 4], expected[32 * 10 * 16];
+        u32 rng = 7;
+        for (u32 i = 0; i < sizeof rgba; i++) { rng = rng * 1664525u + 1013904223u; rgba[i] = (u8)(rng >> 24); }
+        for (u32 i = 0; i < sizeof rgba; i += 4) {
+            if (rgba_mode) memcpy(guest + i, rgba + i, 4);
+            else { guest[i] = rgba[i + 3]; guest[i + 1] = rgba[i]; guest[i + 2] = rgba[i + 1]; guest[i + 3] = rgba[i + 2]; }
+        }
+        const u32 surface = vk_eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, 32, 10, rgba, 32 * 4);
+        REQUIRE(surface);
+        const u32 depth = vk_eng_depth_target_create(NULL, 32, 10);
+        REQUIRE(depth);
+        vk_eng_clear_depth_stencil(NULL, depth, RSX_BE_CLEAR_DEPTH, 0.25f, 0);
+        const int float_depth = s_vk.depth_format == VK_FORMAT_D32_SFLOAT ||
+                                s_vk.depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+        const u32 z24 = (u32)(0.25f * 16777215.0f + 0.5f), z16 = (u32)(0.25f * 65535.0f + 0.5f);
+        u8 zguest[32 * 10 * 4], z16guest[32 * 10 * 2];
+        for (u32 i = 0; i < 32 * 10; i++) {
+            zguest[i * 4] = (u8)(z24 >> 16); zguest[i * 4 + 1] = (u8)(z24 >> 8);
+            zguest[i * 4 + 2] = (u8)z24; zguest[i * 4 + 3] = 0;
+            z16guest[i * 2] = (u8)(z16 >> 8); z16guest[i * 2 + 1] = (u8)z16;
+        }
+        const struct { u32 fmt, target, depth_bytes, pitch, w, h; const u8* src; } cases[] = {
+            { 0x85, surface, 0, 128, 24, 10, guest }, { 0x9c, surface, 0, 128, 32, 10, guest },
+            { 0x95, surface, 0, 128, 20, 7, guest },  { 0x9f, surface, 0, 128, 32, 10, guest },
+            { 0x92, surface, 0, 128, 64, 10, guest }, { 0x90, surface, 0, 128, 32, 9, guest },
+            { 0x9e, surface, 0, 128, 3, 2, guest },
+            { 0x85, depth, 4, 128, 32, 10, zguest },  { 0x90, depth, 4, 128, 32, 10, zguest },
+            { 0x9c, depth, 4, 128, 16, 10, zguest },  { 0x92, depth, 2, 64, 32, 10, z16guest },
+        };
+        u32 passed = 0, run = 0;
+        for (u32 k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+            if (cases[k].depth_bytes && !float_depth) continue;
+            run++;
+            rsx_tex_layout tl;
+            rsx_texture_layout_pitched(cases[k].fmt | 0x20, cases[k].w, cases[k].h, cases[k].pitch, &tl);
+            rsx_texture_decode(expected, tl.dst_row_bytes, cases[k].src, cases[k].w, cases[k].h, &tl, rgba_mode);
+            VkDeviceSize off;
+            REQUIRE(vk_target_convert(cases[k].target, cases[k].depth_bytes, cases[k].pitch,
+                                      cases[k].w, cases[k].h, &tl, tl.base_format, &off) == 1);
+            VkMemoryBarrier b = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT };
+            pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                0, 1, &b, 0, NULL, 0, NULL);
+            REQUIRE(vk_flush() == 0);
+            const u8* actual = (const u8*)s_vb.ring.ptr + off;
+            const size_t bytes = (size_t)tl.dst_row_bytes * tl.rows;
+            if (memcmp(actual, expected, bytes)) {
+                for (size_t i = 0; i < bytes; i++) if (actual[i] != expected[i]) {
+                    fprintf(stderr, "target format=%02x depth=%u byte=%zu GPU=%u CPU=%u\n",
+                        cases[k].fmt, cases[k].depth_bytes, i, actual[i], expected[i]); break;
+                }
+                return 1;
+            }
+            passed++;
+        }
+        printf("GPU target reinterpretation: %u/%u passed (depth format %d)\n", passed, run,
+               (int)s_vk.depth_format);
+        vk_eng_release(NULL, surface);
+        vk_eng_release(NULL, depth);
+    }
     vk_texture_compute_shutdown();
     vk_destroy_buffer(&s_vb.ring);
     pvkDestroyFence(s_vk.device, s_vk.fence, NULL);

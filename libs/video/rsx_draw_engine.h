@@ -213,6 +213,8 @@ typedef struct rsx_draw_backend {
     u32  (*surface_region)(void* user, u32 surface, u32 w, u32 h, u32 remap,
                            u32 rsx_format);
     void (*surface_copy)(void* user, u32 dst_surface, u32 src_surface, u32 w, u32 h);
+    int  (*surface_blit)(void* user, u32 dst_surface, u32 dx, u32 dy, u32 src_surface,
+                         u32 sx, u32 sy, u32 w, u32 h);
 
     /* Present the named surface, and read a rectangle of one back. The rows
      * come back in the format the target was created with, so R,G,B,A for an
@@ -231,6 +233,8 @@ typedef struct rsx_draw_backend {
     int  (*texture_upload_guest)(void* user, u32 texture, u32 face, u32 mip,
                                  u32 w, u32 h, const u8* src,
                                  const rsx_tex_layout* layout);
+    int  (*texture_from_target)(void* user, u32 texture, u32 target, u32 depth_bytes,
+                                u32 pitch, u32 w, u32 h, const rsx_tex_layout* layout);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -293,6 +297,8 @@ void rsx_draw_engine_note_flip(u32 buffer_id);
  * out with the same pitch take part; anything else is left alone. */
 void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
 void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
+int  rsx_draw_engine_blit(u32 src_location, u32 src_offset, u32 src_pitch,
+                          u32 dst_location, u32 dst_offset, u32 dst_pitch, u32 w, u32 h);
 
 /* --- test hooks ---------------------------------------------------------- */
 

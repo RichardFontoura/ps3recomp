@@ -279,11 +279,15 @@ static void stub_present(void* u, u32 s) { (void)u; presented_surface = s; stub.
 /* One pixel of a surface, in the R,G,B,A order rsx_texture_decode produces:
  * the readback hook has to put those back into the guest's A8R8G8B8. */
 static u8 g_stub_pixel[4] = { 0x11, 0x22, 0x33, 0x44 };
+static int g_readbacks;
+static struct { int n; u32 texture, target, depth_bytes, pitch, w, h, base_format; } g_from_target;
+static struct { int n; u32 dst, dx, dy, src, sx, sy, w, h; } g_blit;
 
 static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
                           void* out, u32 pitch)
 {
     (void)u; (void)s; (void)x; (void)y;
+    g_readbacks++;
     for (u32 r = 0; r < h; r++)
         for (u32 c = 0; c < w; c++)
             memcpy((u8*)out + (size_t)r * pitch + c * 4u, g_stub_pixel, 4);
@@ -312,6 +316,27 @@ static void stub_color_write(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
     g_written.surface = s; g_written.x = x; g_written.y = y;
     g_written.w = w; g_written.h = h;
     memcpy(g_written.first, rows, 4);
+}
+
+static int stub_texture_from_target(void* u, u32 texture, u32 target, u32 depth_bytes,
+                                    u32 pitch, u32 w, u32 h, const rsx_tex_layout* tl)
+{
+    (void)u;
+    g_from_target.n++;
+    g_from_target.texture = texture; g_from_target.target = target;
+    g_from_target.depth_bytes = depth_bytes; g_from_target.pitch = pitch;
+    g_from_target.w = w; g_from_target.h = h; g_from_target.base_format = tl->base_format;
+    return 1;
+}
+
+static int stub_surface_blit(void* u, u32 dst, u32 dx, u32 dy, u32 src, u32 sx, u32 sy,
+                             u32 w, u32 h)
+{
+    (void)u;
+    g_blit.n++;
+    g_blit.dst = dst; g_blit.dx = dx; g_blit.dy = dy;
+    g_blit.src = src; g_blit.sx = sx; g_blit.sy = sy; g_blit.w = w; g_blit.h = h;
+    return 1;
 }
 
 static rsx_draw_backend g_stub_backend = {
@@ -1328,6 +1353,74 @@ static void test_color_read_as_float(void)
     engine_down();
 }
 
+static void test_targets_read_on_the_gpu(void)
+{
+    printf("-- targets reinterpreted and blitted on the GPU\n");
+    g_stub_backend.texture_from_target = stub_texture_from_target;
+    g_stub_backend.surface_blit = stub_surface_blit;
+    memset(&g_from_target, 0, sizeof g_from_target);
+    memset(&g_blit, 0, sizeof g_blit);
+    engine_up();
+    m(M_COLOR_A_PITCH, 256u * 4u);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    const u32 surface = stub.last_created_color;
+
+    u8* p = vm_base + GUEST_LOCAL_EA + 0x40000u;
+    memset(p, 0, 16);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, 0x40000u);
+    m(M_TEX_UNIT + 0x04, 1u | (2u << 4) | ((0x9Cu | 0x20u) << 8) | (1u << 16));
+    m(0x1840u, 256u * 4u);
+    const int readbacks = g_readbacks;
+    draw_triangle();
+    CHECK(g_from_target.n == 1 && g_from_target.target == surface &&
+          g_from_target.depth_bytes == 0 && g_from_target.pitch == 1024u &&
+          g_from_target.w == 4 && g_from_target.h == 4 && g_from_target.base_format == 0x9Cu,
+          "an RGBA8 target read as X32_FLOAT is converted from the target on the GPU");
+    CHECK(stub.bound_tex[0] == g_from_target.texture && stub.bound_tex[0] != surface,
+          "the unit samples the converted texture");
+    CHECK(g_readbacks == readbacks && p[0] == 0 && p[1] == 0,
+          "nothing is read back and guest memory is left alone");
+    draw_triangle();
+    CHECK(g_from_target.n == 1, "an unchanged target is not converted again (%d)",
+          g_from_target.n);
+    m(M_COLOR_A_OFFSET, 0x40000u);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+    draw_triangle();
+    CHECK(g_from_target.n == 2 && stub.bound_tex[0] == g_from_target.texture,
+          "a write to the target converts it again into the same texture (%d)",
+          g_from_target.n);
+
+    m(M_COLOR_A_OFFSET, 0x40000u);
+    draw_triangle();
+    m(M_COLOR_A_OFFSET, 0xC0000u);
+    draw_triangle();
+    const u32 dst = stub.bound_rt[0];
+    CHECK(rsx_draw_engine_blit(RSX_LOCATION_LOCAL, 0x40000u + 2u * 1024u + 8u, 1024u,
+                               RSX_LOCATION_LOCAL, 0xC0000u + 5u * 1024u, 1024u, 16u, 8u) == 1 &&
+          g_blit.n == 1 && g_blit.src == surface && g_blit.dst == dst &&
+          g_blit.sx == 2 && g_blit.sy == 2 && g_blit.dx == 0 && g_blit.dy == 5 &&
+          g_blit.w == 16 && g_blit.h == 8,
+          "a transfer between two targets is a GPU copy at the rectangles' positions");
+    CHECK(rsx_draw_engine_blit(RSX_LOCATION_LOCAL, 0x40000u, 1024u,
+                               RSX_LOCATION_MAIN, 0x200000u, 1024u, 16u, 8u) == 0 &&
+          rsx_draw_engine_blit(RSX_LOCATION_LOCAL, 0x40000u + 250u * 4u, 1024u,
+                               RSX_LOCATION_LOCAL, 0xC0000u, 1024u, 16u, 8u) == 0 &&
+          g_blit.n == 1,
+          "a destination that is no target, or a rectangle past the edge, stays on the CPU path");
+
+    const int before = g_readbacks;
+    rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, 0x40000u, 1024u, 200u, 256u);
+    rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, 0x40000u + 200u * 4u, 1024u, 56u, 256u);
+    CHECK(g_readbacks == before + 1 && p[1024u * 255u + 255u * 4u] == 0x44,
+          "a read of every row stores the whole target once, and the next read reuses it (%d)",
+          g_readbacks - before);
+    engine_down();
+    g_stub_backend.texture_from_target = NULL;
+    g_stub_backend.surface_blit = NULL;
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -1360,6 +1453,7 @@ int main(void)
     test_depth_clear_value();
     test_depth_read_as_color();
     test_color_read_as_float();
+    test_targets_read_on_the_gpu();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",
