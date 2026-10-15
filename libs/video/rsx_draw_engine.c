@@ -42,7 +42,7 @@ extern u32 ppu_vm_size;
 #define ENG_MAX_ZDEPTHS    64
 #define ENG_MAX_TEXTURES   RSX_DRAW_ENGINE_TEXTURE_CACHE
 #define ENG_MAX_VTEXTURES  64
-#define ENG_MAX_PIPELINES  8192
+#define ENG_MAX_PIPELINES  RSX_DRAW_ENGINE_MAX_PIPELINES
 #define ENG_MAX_BATCHES    256
 #define ENG_VERT_STRIDE    (RSX_DSP_NUM_VERTEX_ATTR * 16u)
 #define ENG_INVALID        0xFFFFFFFFu
@@ -540,27 +540,25 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
     return g.tex_staging;
 }
 
-/* The colour target for this (location, offset), created or reallocated when
- * the size or format moved. Returns a slot index, or ENG_INVALID.
- * rsx_live_draw.c's surface_get (2605-2690). */
-static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
-                          rsx_be_format want_fmt)
+static u32 eng_surface_get(u32 location, u32 offset, u32 pitch, u32 want_w,
+                          u32 want_h, rsx_be_format want_fmt)
 {
     if (!want_w) want_w = g.width;
     if (!want_h) want_h = g.height;
 
     u32 slot = ENG_MAX_SURFACES;
+    int keep = 0;
     for (u32 i = 0; i < g.n_surfaces; i++)
         if (g.surfaces[i].location == location && g.surfaces[i].offset == offset) {
-            if (g.surfaces[i].w == want_w && g.surfaces[i].h == want_h &&
-                g.surfaces[i].fmt == want_fmt)
+            const eng_surface* s = &g.surfaces[i];
+            keep = s->handle && s->fmt == want_fmt &&
+                   (!s->pitch || !pitch || s->pitch == pitch);
+            if (keep && s->w >= want_w && s->h >= want_h)
                 return i;
             slot = i;
             break;
         }
 
-    /* Never destroy a usable render target because one malformed command
-     * decoded a guest pointer as clip dimensions. */
     if (want_w > ENG_MAX_SURFACE_DIM || want_h > ENG_MAX_SURFACE_DIM) {
         static u32 logs = 0;
         if (logs++ < 8)
@@ -573,10 +571,15 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         if (g.n_surfaces >= ENG_MAX_SURFACES) return ENG_INVALID;
         slot = g.n_surfaces;
     }
+    keep = keep && g.be->surface_copy;
+    if (keep) {
+        if (want_w < g.surfaces[slot].w) want_w = g.surfaces[slot].w;
+        if (want_h < g.surfaces[slot].h) want_h = g.surfaces[slot].h;
+    }
 
     u32 seed_row = 0;
-    const void* seed = eng_surface_seed(location, offset, want_w, want_h,
-                                        want_fmt, &seed_row);
+    const void* seed = keep ? NULL : eng_surface_seed(location, offset, want_w, want_h,
+                                                      want_fmt, &seed_row);
     eng_texture_reclaim((u64)want_w * want_h * 16u);
     const u32 handle = g.be->color_target_create(g.be->user, want_fmt,
                                                  want_w, want_h, seed, seed_row);
@@ -584,16 +587,20 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         return (slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;
 
     eng_surface* s = &g.surfaces[slot];
+    if (keep) g.be->surface_copy(g.be->user, handle, s->handle, s->w, s->h);
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
     s->location = location; s->offset = offset;
     s->w = want_w; s->h = want_h; s->fmt = want_fmt;
     s->handle = handle;
-    s->color_serial = 0;
-    s->guest_dirty = 0;
+    if (!keep) {
+        s->color_serial = 0;
+        s->guest_dirty = 0;
+    }
     if (slot == g.n_surfaces) g.n_surfaces++;
     { static u32 logs = 0; if (logs++ < 16)
         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s\n",
                 location, offset, want_w, want_h, (int)want_fmt,
+                keep ? " (grown, contents kept)" :
                 seed ? " (seeded from guest memory)" : ""); }
     return slot;
 }
@@ -613,7 +620,7 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
     const u32 sel = (sf.color_target == CELL_GCM_SURFACE_TARGET_1) ? 1u : 0u;
     const rsx_be_format fmt = eng_surface_format(sf.color_format);
     const u32 first = eng_surface_get(sf.color_location[sel], sf.color_offset[sel],
-                                      sf.clip_w, sf.clip_h, fmt);
+                                      sf.color_pitch[sel], sf.clip_w, sf.clip_h, fmt);
     if (first == ENG_INVALID) return 0;
     g.surfaces[first].pitch = sf.color_pitch[sel];
     slots[0] = first;
@@ -626,7 +633,7 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
     for (u32 i = 0; i < 3; i++) {
         if (sf.color_target < mrt_from[i]) break;
         const u32 slot = eng_surface_get(sf.color_location[i + 1],
-                                         sf.color_offset[i + 1],
+                                         sf.color_offset[i + 1], sf.color_pitch[i + 1],
                                          sf.clip_w, sf.clip_h, fmt);
         if (slot == ENG_INVALID) break;
         g.surfaces[slot].pitch = sf.color_pitch[i + 1];
@@ -1458,6 +1465,13 @@ static u32 eng_sampled_units(const char* ps)
  * retried on every draw of every frame. `out_tex_used` gets the units the
  * pixel program samples: all of them for the built-in pair, which keeps
  * every enabled unit bound as before. */
+static void eng_pipeline_fail_log(const char* why, u32 value)
+{
+    static u32 n = 0;
+    if (n++ < 64)
+        fprintf(stderr, "[rsx engine] pipeline FAILED before build: %s (%u)\n", why, value);
+}
+
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
@@ -1478,8 +1492,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 unnorm_mask = eng_unnorm_units(unnorm_dim);
 
     memset(&g.fp_constants, 0, sizeof g.fp_constants);
-    if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
+    if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0) {
+        eng_pipeline_fail_log("fragment constants", fp_size);
         return 0;
+    }
 
     /* Identity: the vertex program's own bytes, the fragment program's
      * STRUCTURE (its inline constants are hoisted into the buffered block, so
@@ -1493,7 +1509,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     } else {
         key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
-        if (!key) return 0;
+        if (!key) { eng_pipeline_fail_log("fragment hash", fp_size); return 0; }
         const u32 fp_ctrl_key = fp_ctrl & 0x40u;
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
@@ -1515,7 +1531,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             *out_tex_used = g.pipelines[i].tex_used;
             return g.pipelines[i].handle;
         }
-    if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
+    if (g.n_pipelines >= ENG_MAX_PIPELINES) {
+        eng_pipeline_fail_log("pipeline table full", g.n_pipelines);
+        return 0;
+    }
 
     u32 handle = 0;
     int vi = 1, fi = 1;
@@ -1550,17 +1569,20 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         const char* dir = getenv("RSX_ENGINE_SHADER_DUMP");
         if (dir && *dir) {
             char path[1024];
+            static u32 dumped_fails = 0;
+            const char* stem = handle ? "pipe" : "fail";
+            const u32 id = handle ? handle : dumped_fails++;
             FILE* f;
-            snprintf(path, sizeof path, "%s/pipe%u.vs.hlsl", dir, handle);
+            snprintf(path, sizeof path, "%s/%s%u.vs.hlsl", dir, stem, id);
             if ((f = fopen(path, "w"))) { fputs(s_vs_hlsl, f); fclose(f); }
-            snprintf(path, sizeof path, "%s/pipe%u.ps.hlsl", dir, handle);
+            snprintf(path, sizeof path, "%s/%s%u.ps.hlsl", dir, stem, id);
             if ((f = fopen(path, "w"))) { fputs(s_ps_hlsl, f); fclose(f); }
             if (!fixed && fp_uc && fp_size) {
                 u32 fp_loc = 0;
                 const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
-                snprintf(path, sizeof path, "%s/pipe%u.fp.bin", dir, handle);
+                snprintf(path, sizeof path, "%s/%s%u.fp.bin", dir, stem, id);
                 if ((f = fopen(path, "wb"))) { fwrite(fp_uc, 1, fp_size, f); fclose(f); }
-                snprintf(path, sizeof path, "%s/pipe%u.fp.txt", dir, handle);
+                snprintf(path, sizeof path, "%s/%s%u.fp.txt", dir, stem, id);
                 if ((f = fopen(path, "w"))) {
                     fprintf(f, "location %u offset 0x%08X size %u ctrl 0x%08X\n",
                             fp_loc, fp_off, fp_size, fp_ctrl);
@@ -1569,7 +1591,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             }
         }
     }
-    { static u32 logs = 0; if (logs++ < 32)
+    { static u32 logs = 0, fails = 0;
+      if (logs++ < 32 || (!handle && fails++ < 64))
         fprintf(stderr, "[rsx engine] pipeline %016llx: %s vp %d, fp %d,"
                         " %u constants -> %s\n",
                 (unsigned long long)key, fixed ? "built-in" : "guest",
@@ -1833,6 +1856,14 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                            (int)t.cubemap, t.remap & 0xFFFFu);
             continue;
         }
+        if (sampled >= 0 && g.be->surface_region && !t.cubemap &&
+            (t.width < g.surfaces[sampled].w || t.height < g.surfaces[sampled].h) &&
+            t.pitch && t.pitch == g.surfaces[sampled].pitch) {
+            const u32 region = g.be->surface_region(g.be->user, g.surfaces[sampled].handle,
+                                                    t.width, t.height, t.remap & 0xFFFFu,
+                                                    t.format);
+            if (region) { textures[u] = region; continue; }
+        }
         if (sampled >= 0) {
             const u32 view = g.be->surface_view
                 ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
@@ -1944,7 +1975,7 @@ static int pd_capturing(void)
         s_pd.start = time(NULL);
         s_pd.state = (s_pd.dir && *s_pd.dir) ? 1 : 3;
     }
-    if (s_pd.state == 1 && s_pd.after_s &&
+    if (s_pd.state == 1 && s_pd.after_s && s_pd.min_draws <= 1u &&
         difftime(time(NULL), s_pd.start) >= (double)s_pd.after_s && pd_open_index())
         fprintf(s_pd.index, "from a draw of frame %u, %u s in\n", g.frames, s_pd.after_s);
     return s_pd.state == 2;
@@ -2235,7 +2266,8 @@ static void pd_note_vertices(const rsx_vertex_layout_plan* layout, u32 n_draw,
 static void pd_present(u32 presented)
 {
     if (s_pd.state == 0) pd_capturing();
-    if (s_pd.state == 1 && !s_pd.after_s && g.guest_draws >= s_pd.min_draws) {
+    if (s_pd.state == 1 && g.guest_draws >= s_pd.min_draws &&
+        (!s_pd.after_s || difftime(time(NULL), s_pd.start) >= (double)s_pd.after_s)) {
         if (pd_open_index())
             fprintf(s_pd.index, "frame %u (after a frame of %u guest draws)\n",
                     g.frames + 1, g.guest_draws);
@@ -2251,6 +2283,30 @@ static void pd_present(u32 presented)
                 s_pd.pass, presented, g.surfaces[presented].offset, g.guest_draws);
         fflush(s_pd.index);
     }
+}
+
+static void eng_scissor_rect(const rsx_dsp_surface* sf, u32 surface_w, u32 surface_h,
+                             u32* x, u32* y, u32* w, u32* h)
+{
+    u32 sx = 0, sy = 0;
+    u32 right = sf->clip_w ? sf->clip_w : g.width;
+    u32 bottom = sf->clip_h ? sf->clip_h : g.height;
+    if (right > surface_w) right = surface_w;
+    if (bottom > surface_h) bottom = surface_h;
+    const u32 hr = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
+    const u32 vr = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+    const u32 gx = hr & 0xFFFFu, gw = hr >> 16;
+    const u32 gy = vr & 0xFFFFu, gh = vr >> 16;
+    if (gw > 0 && gh > 0) {
+        if (gx > sx) sx = gx;
+        if (gy > sy) sy = gy;
+        if (gx + gw < right)  right = gx + gw;
+        if (gy + gh < bottom) bottom = gy + gh;
+    }
+    *x = sx;
+    *y = sy;
+    *w = right > sx ? right - sx : 0;
+    *h = bottom > sy ? bottom - sy : 0;
 }
 
 static void sink_end(void* user, const rsx_dispatch* r)
@@ -2397,26 +2453,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
     g.be->set_viewport(g.be->user, 0.0f, 0.0f, W, H);
 
-    /* The guest scissor intersected with the surface. The nv40 reset is a
-     * full 4096x4096 window and a never-written register reads 0 here, which
-     * the w == 0 test treats as no scissor, so only a real game scissor
-     * narrows anything (rsx_live_draw.c:6180-6197). */
     {
-        u32 sx = 0, sy = 0;
-        u32 sw = g.surfaces[target].w, sh = g.surfaces[target].h;
-        const u32 h = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
-        const u32 v = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
-        const u32 gx = h & 0xFFFFu, gw = h >> 16;
-        const u32 gy = v & 0xFFFFu, gh = v >> 16;
-        if (gw > 0 && gh > 0) {
-            u32 right = sx + sw, bottom = sy + sh;
-            if (gx > sx) sx = gx;
-            if (gy > sy) sy = gy;
-            if (gx + gw < right)  right = gx + gw;
-            if (gy + gh < bottom) bottom = gy + gh;
-            sw = right > sx ? right - sx : 0;
-            sh = bottom > sy ? bottom - sy : 0;
-        }
+        u32 sx, sy, sw, sh;
+        eng_scissor_rect(&sf, g.surfaces[target].w, g.surfaces[target].h, &sx, &sy, &sw, &sh);
         g.be->set_scissor(g.be->user, sx, sy, sw, sh);
     }
     /* Dynamic, and deliberately outside the pipeline key. */
@@ -2483,11 +2522,18 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             (float)( c        & 0xFF) / 255.0f,
             (float)((c >> 24) & 0xFF) / 255.0f,
         };
-        /* Every target the set names, not only A: a deferred pass clears its
-         * whole G-buffer in one CLEAR_SURFACE, and B, C and D would otherwise
-         * keep whatever the last frame left in them. */
-        for (u32 i = 0; i < n_targets; i++)
-            g.be->clear_color(g.be->user, g.surfaces[targets[i]].handle, rgba);
+        rsx_dsp_surface cs;
+        rsx_dsp_get_surface(&g.rsx, &cs);
+        for (u32 i = 0; i < n_targets; i++) {
+            const eng_surface* s = &g.surfaces[targets[i]];
+            u32 x, y, w, h;
+            eng_scissor_rect(&cs, s->w, s->h, &x, &y, &w, &h);
+            if (!w || !h) continue;
+            if (g.be->clear_color_rect && (x || y || w != s->w || h != s->h))
+                g.be->clear_color_rect(g.be->user, s->handle, x, y, w, h, rgba);
+            else
+                g.be->clear_color(g.be->user, s->handle, rgba);
+        }
         eng_surfaces_wrote(targets, n_targets);
     }
     if (mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) {
@@ -2503,8 +2549,17 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         const int z16 = sf.depth_format == 1u;
         const int zfloat = (rsx_dsp_reg(&g.rsx, M_CONTROL0) >> 12) & 1u;
         const float depth = eng_depth_clear_value(zs, z16, zfloat);
-        g.be->clear_depth_stencil(g.be->user, g.zdepths[zslot].handle, flags,
-                                  depth, z16 ? 0 : (u8)(zs & 0xFFu));
+        const eng_zdepth* zc = &g.zdepths[zslot];
+        u32 x, y, w, h;
+        eng_scissor_rect(&sf, zc->w, zc->h, &x, &y, &w, &h);
+        if (g.be->clear_depth_stencil_rect && (x || y || w != zc->w || h != zc->h)) {
+            if (w && h)
+                g.be->clear_depth_stencil_rect(g.be->user, zc->handle, flags, depth,
+                                               z16 ? 0 : (u8)(zs & 0xFFu), x, y, w, h);
+        } else {
+            g.be->clear_depth_stencil(g.be->user, zc->handle, flags,
+                                      depth, z16 ? 0 : (u8)(zs & 0xFFu));
+        }
         g.zdepths[zslot].cleared = 1;
         if (mask & RSX_CLEAR_DEPTH) {
             /* A clear invalidates the older published depth image; the next
@@ -2551,6 +2606,10 @@ static void eng_present(u32 buffer_id)
                     i, g.surfaces[i].location, g.surfaces[i].offset,
                     g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
     }
+    for (u32 i = 0; i < g.n_surfaces; i++)
+        if (g.surfaces[i].handle && g.surfaces[i].location == RSX_LOCATION_MAIN &&
+            g.surfaces[i].guest_dirty)
+            eng_surface_to_guest(i);
     pd_present(target);
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);

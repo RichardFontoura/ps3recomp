@@ -96,7 +96,7 @@
     X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
     X(vkCreateSampler) X(vkDestroySampler) \
     X(vkCmdPipelineBarrier) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) \
-    X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) \
+    X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImage) \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
@@ -2285,6 +2285,15 @@ typedef struct vk_eng_obj {
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
 
+typedef struct vk_eng_scratch {
+    vk_image           im;
+    VkFormat           fmt;
+    VkImageAspectFlags aspect;
+    u32                w, h;
+} vk_eng_scratch;
+
+static vk_eng_scratch s_eng_scratch[4];
+
 /* Defined with the E2 pipeline state further down. */
 static void vk_eng_drop_framebuffers(void);
 static void vk_eng2_shutdown(void* user);
@@ -2574,6 +2583,165 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
     vk_end_op();
 }
 
+static vk_eng_scratch* vk_eng_clear_source(VkFormat fmt, VkImageAspectFlags aspect, u32 w, u32 h)
+{
+    vk_eng_scratch* pick = NULL;
+    for (u32 i = 0; i < 4 && !pick; i++)
+        if (s_eng_scratch[i].im.img && s_eng_scratch[i].fmt == fmt) pick = &s_eng_scratch[i];
+    if (pick && pick->w >= w && pick->h >= h) return pick;
+    if (!pick)
+        for (u32 i = 0; i < 4 && !pick; i++)
+            if (!s_eng_scratch[i].im.img) pick = &s_eng_scratch[i];
+    if (!pick) pick = &s_eng_scratch[0];
+    if (pick->im.img && pick->fmt == fmt) {
+        if (pick->w > w) w = pick->w;
+        if (pick->h > h) h = pick->h;
+    }
+    vk_destroy_image(&pick->im);
+    memset(pick, 0, sizeof *pick);
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+        ((aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                                              : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    if (vk_create_image(&pick->im, fmt, w, h, usage, aspect)) {
+        vk_destroy_image(&pick->im);
+        return NULL;
+    }
+    pick->fmt = fmt; pick->aspect = aspect; pick->w = w; pick->h = h;
+    if (vk_begin()) return NULL;
+    vk_barrier_image(pick->im.img, aspect, VK_IMAGE_LAYOUT_UNDEFINED);
+    return pick;
+}
+
+static int vk_eng_rect_clip(u32 iw, u32 ih, u32* x, u32* y, u32* w, u32* h)
+{
+    if (*x >= iw || *y >= ih) return 0;
+    if (*w > iw - *x) *w = iw - *x;
+    if (*h > ih - *y) *h = ih - *y;
+    return *w && *h;
+}
+
+static void vk_eng_clear_color_rect(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+                                    const float rgba[4])
+{
+    vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
+    if (!o || !vk_eng_rect_clip(o->w, o->h, &x, &y, &w, &h)) return;
+    if (!x && !y && w == o->w && h == o->h) { vk_eng_clear_color(user, surface, rgba); return; }
+    vk_eng_scratch* src = vk_eng_clear_source(o->fmt, VK_IMAGE_ASPECT_COLOR_BIT, w, h);
+    if (!src || vk_begin()) return;
+    VkClearColorValue v;
+    memcpy(v.float32, rgba, sizeof v.float32);
+    VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vk_barrier_image(src->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    pvkCmdClearColorImage(s_vk.cmd, src->im.img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
+    vk_barrier_image(src->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    VkImageCopy c = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                      .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                      .dstOffset = { (int32_t)x, (int32_t)y, 0 }, .extent = { w, h, 1 } };
+    pvkCmdCopyImage(s_vk.cmd, src->im.img, VK_IMAGE_LAYOUT_GENERAL, o->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    vk_end_op();
+}
+
+static void vk_eng_clear_depth_stencil_rect(void* user, u32 depth, u32 flags, float depth_value,
+                                            u8 stencil, u32 x, u32 y, u32 w, u32 h)
+{
+    vk_eng_obj* o = vk_eng_get(depth, VK_ENG_DEPTH);
+    if (!o || !vk_eng_rect_clip(o->w, o->h, &x, &y, &w, &h)) return;
+    if (!x && !y && w == o->w && h == o->h) {
+        vk_eng_clear_depth_stencil(user, depth, flags, depth_value, stencil);
+        return;
+    }
+    VkImageAspectFlags aspect = 0;
+    if (flags & RSX_BE_CLEAR_DEPTH) aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (flags & RSX_BE_CLEAR_STENCIL) aspect |= s_vk.depth_aspect & VK_IMAGE_ASPECT_STENCIL_BIT;
+    if (!aspect) return;
+    vk_eng_scratch* src = vk_eng_clear_source(s_vk.depth_format, s_vk.depth_aspect, w, h);
+    if (!src || vk_begin()) return;
+    VkClearDepthStencilValue d = { depth_value, stencil };
+    VkImageSubresourceRange r = { s_vk.depth_aspect, 0, 1, 0, 1 };
+    vk_barrier_image(src->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
+    pvkCmdClearDepthStencilImage(s_vk.cmd, src->im.img, VK_IMAGE_LAYOUT_GENERAL, &d, 1, &r);
+    vk_barrier_image(src->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
+    VkImageCopy c[2];
+    u32 n = 0;
+    const VkImageAspectFlags parts[2] = { VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT };
+    for (u32 i = 0; i < 2; i++) {
+        if (!(aspect & parts[i])) continue;
+        VkImageCopy one = { .srcSubresource = { parts[i], 0, 0, 1 },
+                            .dstSubresource = { parts[i], 0, 0, 1 },
+                            .dstOffset = { (int32_t)x, (int32_t)y, 0 }, .extent = { w, h, 1 } };
+        c[n++] = one;
+    }
+    pvkCmdCopyImage(s_vk.cmd, src->im.img, VK_IMAGE_LAYOUT_GENERAL, o->im.img, VK_IMAGE_LAYOUT_GENERAL, n, c);
+    vk_end_op();
+}
+
+static void vk_eng_copy_top_left(VkImage src, VkImage dst, u32 w, u32 h)
+{
+    vk_barrier_image(src, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(dst, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    VkImageCopy c = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                      .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                      .extent = { w, h, 1 } };
+    pvkCmdCopyImage(s_vk.cmd, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    vk_barrier_image(dst, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+}
+
+static u32 vk_eng_surface_region(void* user, u32 surface, u32 w, u32 h, u32 remap, u32 rsx_format)
+{
+    (void)user;
+    vk_eng_obj* t = vk_eng_get(surface, VK_ENG_COLOR);
+    if (!t || !w || !h) return 0;
+    if (w > t->w) w = t->w;
+    if (h > t->h) h = t->h;
+    u32 hd = 0;
+    for (u32 i = 1; i < VK_ENG_MAX_OBJ && !hd; i++)
+        if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].im.img && s_eobj[i].surface == surface &&
+            s_eobj[i].w == w && s_eobj[i].h == h && s_eobj[i].remap == remap &&
+            s_eobj[i].rsx_fmt == rsx_format)
+            hd = i;
+    if (!hd) {
+        hd = vk_eng_alloc();
+        if (!hd) return 0;
+        vk_eng_obj* o = &s_eobj[hd];
+        if (vk_create_image(&o->im, t->fmt, w, h,
+                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT)) {
+            vk_destroy_image(&o->im); memset(o, 0, sizeof *o); return 0;
+        }
+        VkImageView plain = o->im.view;
+        if (vk_eng_make_view(o->im.img, t->fmt, 1, vk_remap(remap, rsx_format), 0, &o->im.view)) {
+            vk_destroy_image(&o->im); memset(o, 0, sizeof *o); return 0;
+        }
+        if (plain) pvkDestroyImageView(s_vk.device, plain, NULL);
+        o->kind = VK_ENG_VIEW; o->fmt = t->fmt; o->bpp = t->bpp; o->w = w; o->h = h;
+        o->surface = surface; o->remap = remap; o->rsx_fmt = rsx_format;
+        if (vk_begin()) return 0;
+        vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+        t = vk_eng_get(surface, VK_ENG_COLOR);
+    }
+    if (vk_begin()) return 0;
+    vk_eng_copy_top_left(t->im.img, s_eobj[hd].im.img, w, h);
+    vk_end_op();
+    return hd;
+}
+
+static void vk_eng_surface_copy(void* user, u32 dst_surface, u32 src_surface, u32 w, u32 h)
+{
+    (void)user;
+    vk_eng_obj* d = vk_eng_get(dst_surface, VK_ENG_COLOR);
+    vk_eng_obj* s = vk_eng_get(src_surface, VK_ENG_COLOR);
+    if (!d || !s || d->fmt != s->fmt) return;
+    if (w > d->w) w = d->w;
+    if (w > s->w) w = s->w;
+    if (h > d->h) h = d->h;
+    if (h > s->h) h = s->h;
+    if (!w || !h || vk_begin()) return;
+    vk_eng_copy_top_left(s->im.img, d->im.img, w, h);
+    vk_end_op();
+}
+
 static void vk_eng_present(void* user, u32 surface)
 {
     (void)user;
@@ -2714,7 +2882,7 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
     vk_eng_obj* t = vk_eng_get(surface, VK_ENG_COLOR);
     if (!t) return 0;
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
-        if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == surface &&
+        if (s_eobj[i].kind == VK_ENG_VIEW && !s_eobj[i].im.img && s_eobj[i].surface == surface &&
             s_eobj[i].remap == remap && s_eobj[i].rsx_fmt == rsx_format)
             return i;
     const u32 hd = vk_eng_alloc();
@@ -2853,7 +3021,7 @@ static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32
  * samplers s0..s3 would alias the pixel samplers' binding), colour targets
  * other than RGBA8 and RGBA16F, depth-only passes, and stencil (the depth format
  * has no stencil aspect yet, so the test is inert). */
-#define VK_ENG_MAX_PIPE   512
+#define VK_ENG_MAX_PIPE   RSX_DRAW_ENGINE_MAX_PIPELINES
 #define VK_ENG_TOPOLOGIES 5
 #define VK_ENG_FB_CACHE   64
 
@@ -3090,7 +3258,10 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
     u32 slot = VK_ENG_MAX_PIPE;
     for (u32 i = 0; i < VK_ENG_MAX_PIPE; i++) if (!s_epipe[i].used) { slot = i; break; }
-    if (slot == VK_ENG_MAX_PIPE) return 0;
+    if (slot == VK_ENG_MAX_PIPE) {
+        if (!(s_e2.warned & 8u)) { VK_LOG("engine: pipeline table full (%u)\n", VK_ENG_MAX_PIPE); s_e2.warned |= 8u; }
+        return 0;
+    }
     vk_eng_pipe* P = &s_epipe[slot];
     memset(P, 0, sizeof *P);
     if (vk_eng_translate(vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs)) return 0;
@@ -3233,6 +3404,8 @@ static void vk_eng2_shutdown(void* user)
         for (u32 n = 0; n <= RSX_BE_MAX_COLOR_TARGETS; n++)
             if (s_e2.rp[f][n]) pvkDestroyRenderPass(s_vk.device, s_e2.rp[f][n], NULL);
     vk_destroy_image(&s_e2.scratch_depth);
+    for (u32 i = 0; i < 4; i++) vk_destroy_image(&s_eng_scratch[i].im);
+    memset(s_eng_scratch, 0, sizeof s_eng_scratch);
     vk_destroy_buffer(&s_e2.indices);
     if (s_e2.split_pipe_layout) pvkDestroyPipelineLayout(s_vk.device, s_e2.split_pipe_layout, NULL);
     if (s_e2.split_pool)        pvkDestroyDescriptorPool(s_vk.device, s_e2.split_pool, NULL);
@@ -3571,6 +3744,10 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .draw                 = vk_eng_draw,
     .clear_color          = vk_eng_clear_color,
     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
+    .clear_color_rect     = vk_eng_clear_color_rect,
+    .clear_depth_stencil_rect = vk_eng_clear_depth_stencil_rect,
+    .surface_region       = vk_eng_surface_region,
+    .surface_copy         = vk_eng_surface_copy,
     .present              = vk_eng_present,
     .readback             = vk_eng_readback,
     .depth_readback       = vk_eng_depth_readback,

@@ -74,6 +74,8 @@ typedef struct {
     int n_depth_create, n_depth_snapshot;
     int n_pipeline_create;
     int n_draw, n_clear_color, n_clear_ds, n_present;
+    int n_clear_rect, n_clear_ds_rect, n_region, n_surface_copy;
+    u32 clear_rect[4], copy_size[2], region_size[2];
     u32 cleared[STUB_MAX_CLEARED];
 
     /* the last draw's bindings */
@@ -241,6 +243,36 @@ static void stub_clear_color(void* u, u32 s, const float rgba[4])
 static void stub_clear_ds(void* u, u32 d, u32 f, float z, u8 s)
 { (void)u; (void)d; (void)f; (void)s; stub.n_clear_ds++; stub.last_clear_depth = z; }
 
+static void stub_clear_rect(void* u, u32 s, u32 x, u32 y, u32 w, u32 h, const float rgba[4])
+{
+    (void)u; (void)s; (void)rgba;
+    stub.n_clear_rect++;
+    stub.clear_rect[0] = x; stub.clear_rect[1] = y;
+    stub.clear_rect[2] = w; stub.clear_rect[3] = h;
+}
+
+static void stub_clear_ds_rect(void* u, u32 d, u32 f, float z, u8 st, u32 x, u32 y, u32 w, u32 h)
+{
+    (void)u; (void)d; (void)f; (void)st; (void)x; (void)y; (void)w; (void)h;
+    stub.n_clear_ds_rect++;
+    stub.last_clear_depth = z;
+}
+
+static u32 stub_surface_region(void* u, u32 surface, u32 w, u32 h, u32 remap, u32 fmt)
+{
+    (void)u; (void)remap; (void)fmt;
+    stub.n_region++;
+    stub.region_size[0] = w; stub.region_size[1] = h;
+    return surface | 0x40000000u;
+}
+
+static void stub_surface_copy(void* u, u32 dst, u32 src, u32 w, u32 h)
+{
+    (void)u; (void)dst; (void)src;
+    stub.n_surface_copy++;
+    stub.copy_size[0] = w; stub.copy_size[1] = h;
+}
+
 static u32 presented_surface;
 static void stub_present(void* u, u32 s) { (void)u; presented_surface = s; stub.n_present++; }
 
@@ -311,6 +343,10 @@ static const rsx_draw_backend g_stub_backend = {
     .draw = stub_draw,
     .clear_color = stub_clear_color,
     .clear_depth_stencil = stub_clear_ds,
+    .clear_color_rect = stub_clear_rect,
+    .clear_depth_stencil_rect = stub_clear_ds_rect,
+    .surface_region = stub_surface_region,
+    .surface_copy = stub_surface_copy,
     .present = stub_present,
     .readback = stub_readback,
     .depth_readback = stub_depth_readback,
@@ -336,6 +372,8 @@ static const rsx_draw_backend g_stub_backend = {
 #define M_COLOR_MASK          0x0324
 #define M_DEPTH_WRITE         0x0A70
 #define M_DEPTH_TEST          0x0A74
+#define M_DEPTH_FUNC          0x0A6C
+#define M_TEX_SIZE1           0x1840
 #define M_COLOR_C_OFFSET      0x0288
 #define M_COLOR_D_OFFSET      0x028C
 #define M_SCISSOR_H           0x08C0
@@ -704,6 +742,81 @@ static void test_pipeline_key(void)
           "nor does the stencil reference, which reaches the encoder (%u)",
           stub.stencil_ref);
 
+    engine_down();
+}
+
+static void test_pipeline_capacity(void)
+{
+    printf("-- pipeline capacity\n");
+    engine_up();
+    const u32 n = 600;
+    for (u32 i = 0; i < n; i++) {
+        m(M_DEPTH_FUNC, 0x0200u + i);
+        draw_triangle();
+    }
+    CHECK(stub.n_pipeline_create == (int)n,
+          "more than 512 distinct pipelines all reach the backend (%d of %u)",
+          stub.n_pipeline_create, n);
+    CHECK(stub.n_draw == (int)n, "and none of their draws is dropped (%d)", stub.n_draw);
+    engine_down();
+}
+
+static void test_surface_subregions(void)
+{
+    printf("-- surface sub-regions\n");
+    engine_up();
+    m(M_COLOR_A_PITCH, 1024u);
+    draw_triangle();
+    const int created = stub.n_color_create;
+    const u32 surface = stub.bound_surface;
+
+    m(M_SURFACE_CLIP_H, 128u << 16);
+    m(M_SURFACE_CLIP_V, 128u << 16);
+    draw_triangle();
+    CHECK(stub.n_color_create == created && stub.bound_surface == surface,
+          "a smaller clip at the same address and pitch draws into the same target");
+    CHECK(stub.scissor[2] == 128u && stub.scissor[3] == 128u,
+          "with the scissor held to the clip (%ux%u)", stub.scissor[2], stub.scissor[3]);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.n_clear_rect == 1 && stub.clear_rect[2] == 128u && stub.clear_rect[3] == 128u,
+          "and a colour clear covers only the clip (%d, %ux%u)", stub.n_clear_rect,
+          stub.clear_rect[2], stub.clear_rect[3]);
+
+    m(M_SURFACE_CLIP_H, 256u << 16);
+    m(M_SURFACE_CLIP_V, 256u << 16);
+    m(M_SCISSOR_H, (64u << 16) | 16u);
+    m(M_SCISSOR_V, (32u << 16) | 8u);
+    const int full = stub.n_clear_color;
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.n_clear_rect == 2 && stub.n_clear_color == full &&
+          stub.clear_rect[0] == 16u && stub.clear_rect[1] == 8u &&
+          stub.clear_rect[2] == 64u && stub.clear_rect[3] == 32u,
+          "a clear honours the guest scissor (%u,%u %ux%u)", stub.clear_rect[0],
+          stub.clear_rect[1], stub.clear_rect[2], stub.clear_rect[3]);
+    m(M_SCISSOR_H, 0u);
+    m(M_SCISSOR_V, 0u);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.n_clear_color == full + 1, "and without one it clears the whole target");
+
+    m(M_SURFACE_CLIP_H, 512u << 16);
+    m(M_SURFACE_CLIP_V, 512u << 16);
+    draw_triangle();
+    const u32 grown = stub.bound_surface;
+    CHECK(stub.n_color_create == created + 1 && stub.n_surface_copy == 1 &&
+          stub.copy_size[0] == 256u && stub.copy_size[1] == 256u,
+          "growing the clip keeps what was drawn (%d copies, %ux%u)", stub.n_surface_copy,
+          stub.copy_size[0], stub.copy_size[1]);
+
+    m(M_COLOR_A_OFFSET, 0x90000u);
+    m(M_SURFACE_CLIP_H, 256u << 16);
+    m(M_SURFACE_CLIP_V, 256u << 16);
+    bind_texture_unit(RSX_LOCATION_LOCAL, 0x40000u);
+    m(M_TEX_SIZE1, 1024u);
+    draw_triangle();
+    CHECK(stub.n_region == 1 && stub.region_size[0] == 4u && stub.region_size[1] == 4u &&
+          stub.bound_tex[0] == (grown | 0x40000000u),
+          "a smaller texture with the surface's pitch samples its top-left corner (%d, %ux%u)",
+          stub.n_region, stub.region_size[0], stub.region_size[1]);
     engine_down();
 }
 
@@ -1091,7 +1204,7 @@ static void test_depth_clear_value(void)
     m(M_SURFACE_FORMAT, 8u | (1u << 5));
     m(M_ZSTENCIL_CLEAR, 0xFFFFu);
     m(M_CLEAR_BUFFERS, 0x01u);
-    CHECK(stub.n_clear_ds == 1 && stub.last_clear_depth == 1.0f,
+    CHECK(stub.n_clear_ds + stub.n_clear_ds_rect == 1 && stub.last_clear_depth == 1.0f,
           "a Z16 zeta cleared with 0xFFFF clears to 1.0 (%g)", stub.last_clear_depth);
 
     /* Z24S8 (depth field 2): depth24 << 8 | stencil8. */
@@ -1203,6 +1316,8 @@ int main(void)
     test_texture_cache();
     test_texture_out_of_memory();
     test_pipeline_key();
+    test_pipeline_capacity();
+    test_surface_subregions();
     test_restart_expansion();
     test_indexed_draws();
     test_scissor();

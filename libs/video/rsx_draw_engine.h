@@ -104,6 +104,8 @@ typedef struct rsx_be_render_state {
  * where the boundary is rather than assuming a number. */
 #define RSX_DRAW_ENGINE_TEXTURE_CACHE 1024
 
+#define RSX_DRAW_ENGINE_MAX_PIPELINES 8192
+
 /* ---- the backend interface ---------------------------------------------- */
 
 typedef struct rsx_draw_backend {
@@ -203,6 +205,14 @@ typedef struct rsx_draw_backend {
     void (*clear_color)(void* user, u32 surface, const float rgba[4]);
     void (*clear_depth_stencil)(void* user, u32 depth, u32 flags,
                                 float depth_value, u8 stencil);
+    void (*clear_color_rect)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+                             const float rgba[4]);
+    void (*clear_depth_stencil_rect)(void* user, u32 depth, u32 flags,
+                                     float depth_value, u8 stencil,
+                                     u32 x, u32 y, u32 w, u32 h);
+    u32  (*surface_region)(void* user, u32 surface, u32 w, u32 h, u32 remap,
+                           u32 rsx_format);
+    void (*surface_copy)(void* user, u32 dst_surface, u32 src_surface, u32 w, u32 h);
 
     /* Present the named surface, and read a rectangle of one back. The rows
      * come back in the format the target was created with, so R,G,B,A for an
