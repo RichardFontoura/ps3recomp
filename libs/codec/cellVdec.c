@@ -13,6 +13,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <time.h>
+#endif
 #include "vdec_ffmpeg.h"
 #include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
 #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
@@ -70,6 +75,23 @@ static const struct { u32 code; u32 num; u32 den; } k_vdec_rates[] = {
 
 static VdecSlot s_vdec[MAX_VDEC];
 
+static u64 vdec_perf_us(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("VDEC_PERF") != NULL;
+    if (!enabled) return 0;
+#ifdef _WIN32
+    LARGE_INTEGER t, f;
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&f);
+    return (u64)(t.QuadPart / f.QuadPart) * 1000000ull +
+           (u64)(t.QuadPart % f.QuadPart) * 1000000ull / f.QuadPart;
+#else
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (u64)t.tv_sec * 1000000ull + (u64)t.tv_nsec / 1000ull;
+#endif
+}
 
 /* Deliver a vdec message to the guest callback (handle, msgType, msgData,
  * cbArg). It is a guest OPD, so it goes through g_ps3_guest_caller; this used
@@ -326,9 +348,16 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
         v->auCount++;
         v->aus[v->auCount % VDEC_AU_RING] = au;
         v->newPics = 0;
+        const u64 begin = vdec_perf_us();
         if (au.size)   /* an empty packet would mean end of stream to FFmpeg */
             vdec_ff_decode(v->ff, vm_ptr8(au.startAddr), au.size, v->auCount,
                            vdec_on_picture, v);
+        if (begin) {
+            const u64 end = vdec_perf_us();
+            fprintf(stderr, "[vdec-perf] decode host_us=%llu duration_us=%llu au=%u queued=%u pictures=%u\n",
+                (unsigned long long)end, (unsigned long long)(end - begin),
+                v->auCount, v->qCount, v->newPics);
+        }
         vdec_notify(handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_OK);
         vdec_notify_new_pics(handle);
         return CELL_OK;
@@ -473,9 +502,17 @@ static s32 vdec_take_picture(VdecSlot* v, u32 dst, u32 type, u32 matrix, u8 alph
     VdecPic* q = &v->queue[v->qHead];
     v->qHead = (v->qHead + 1) % VDEC_QUEUE;
     v->qCount--;
+    const u64 begin = vdec_perf_us();
     if (dst)                                           /* NULL: a skip */
         vdec_store_picture(dst, q->yuv, q->item.width, q->item.height,
                            type, matrix, alpha);
+    if (begin) {
+        const u64 end = vdec_perf_us();
+        fprintf(stderr, "[vdec-perf] picture host_us=%llu duration_us=%llu pts=%llu frc=%u size=%ux%u format=%u skip=%u queued=%u\n",
+            (unsigned long long)end, (unsigned long long)(end - begin),
+            (unsigned long long)q->item.pts, q->frc, q->item.width, q->item.height,
+            type, dst == 0, v->qCount);
+    }
     free(q->yuv);
     q->yuv = NULL;
     return CELL_OK;

@@ -314,7 +314,7 @@ static void stub_color_write(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
     memcpy(g_written.first, rows, 4);
 }
 
-static const rsx_draw_backend g_stub_backend = {
+static rsx_draw_backend g_stub_backend = {
     .user = NULL,
     .init = stub_init,
     .shutdown = stub_shutdown,
@@ -603,6 +603,36 @@ static void test_mrt_set(void)
 }
 
 /* ---- 3. the texture cache ------------------------------------------------ */
+
+static int raw_upload_result, raw_upload_calls;
+static int stub_guest_upload(void* u, u32 t, u32 face, u32 mip, u32 w, u32 h,
+                              const u8* src, const rsx_tex_layout* tl)
+{
+    (void)u; (void)t; (void)face; (void)mip;
+    raw_upload_calls++;
+    CHECK(w == 4 && h == 4 && tl->face_bytes == 64, "raw upload dimensions");
+    CHECK(src[0] == 0x11 && src[63] == 0x11, "raw guest payload preserved");
+    return raw_upload_result;
+}
+
+static void test_guest_texture_upload(void)
+{
+    for (int result = -1; result <= 1; result++) {
+        g_stub_backend.texture_upload_guest = stub_guest_upload;
+        engine_up();
+        raw_upload_calls = 0;
+        raw_upload_result = result;
+        bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+        memset(vm_base + TEX_OFFSET, 0x11, 64);
+        draw_triangle();
+        CHECK(raw_upload_calls == 1, "raw callback invoked");
+        CHECK(stub.n_texture_upload == (result == 0), "CPU fallback only when declined");
+        if (result < 0)
+            CHECK(stub.n_texture_release == 1, "failed raw upload releases resource");
+        engine_down();
+    }
+    g_stub_backend.texture_upload_guest = NULL;
+}
 
 static void test_texture_cache(void)
 {
@@ -1314,6 +1344,7 @@ int main(void)
     test_surface_aliasing();
     test_mrt_set();
     test_texture_cache();
+    test_guest_texture_upload();
     test_texture_out_of_memory();
     test_pipeline_key();
     test_pipeline_capacity();

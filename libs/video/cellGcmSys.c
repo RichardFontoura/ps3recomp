@@ -101,6 +101,7 @@ static volatile int s_flip_pending = 0;
 /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
  * derive it from the observed per-frame volume if a title outgrows it. */
 #define GCM_FLIP_WRAP_BYTES 0x40000u
+#define GCM_VBLANK_BURST_MAX 8u
 
 int cellGcm_take_flip_pending(void)
 {
@@ -660,6 +661,9 @@ static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
 #define GCM_PENDING_SET(bits)  InterlockedOr(&s_gcm_pending, (bits))
 #define GCM_PENDING_TAKE()     InterlockedExchange(&s_gcm_pending, 0)
 static volatile LONG s_gcm_pumping = 0;
+static volatile LONG s_vblank_undelivered = 0;
+#define GCM_VBLANK_QUEUE()     InterlockedIncrement(&s_vblank_undelivered)
+#define GCM_VBLANK_TAKE()      ((u32)InterlockedExchange(&s_vblank_undelivered, 0))
 #define GCM_PUMP_TRY_ENTER() (InterlockedCompareExchange(&s_gcm_pumping, 1, 0) == 0)
 #define GCM_PUMP_LEAVE()     InterlockedExchange(&s_gcm_pumping, 0)
 #else
@@ -668,6 +672,9 @@ static atomic_int s_gcm_pending = 0;
 #define GCM_PENDING_SET(bits)  atomic_fetch_or(&s_gcm_pending, (bits))
 #define GCM_PENDING_TAKE()     atomic_exchange(&s_gcm_pending, 0)
 static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
+static atomic_uint s_vblank_undelivered = 0;
+#define GCM_VBLANK_QUEUE()     atomic_fetch_add(&s_vblank_undelivered, 1u)
+#define GCM_VBLANK_TAKE()      atomic_exchange(&s_vblank_undelivered, 0u)
 #define GCM_PUMP_TRY_ENTER() (!atomic_flag_test_and_set_explicit(&s_gcm_pumping, memory_order_acquire))
 #define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
 #endif
@@ -679,6 +686,7 @@ static u32 s_fifo_getoff;   /* tentative: defined below */
 void cellGcm_request_tick(void)
 {
     s_vblank_count++;
+    GCM_VBLANK_QUEUE();
     /* GCM_FLIP_NEEDS_FIFO=1: only mark a flip pending once the walker has
      * actually consumed up to `put`.
      *
@@ -709,17 +717,21 @@ void ppu_gcm_pump(void)
     if (!GCM_PUMP_TRY_ENTER()) return;
     long p = (long)GCM_PENDING_TAKE();
     u64 user = GCM_USER_PENDING_TAKE();
-    /* GCM_PUMP_DBG=1: how often each guest handler is actually delivered. */
+    u32 vblanks = (p & 1) ? GCM_VBLANK_TAKE() : 0;
+    if (vblanks > GCM_VBLANK_BURST_MAX) vblanks = GCM_VBLANK_BURST_MAX;
     { static int d = -1; static unsigned nv, nf, calls;
       if (d < 0) d = getenv("GCM_PUMP_DBG") ? 1 : 0;
-      if (d) { calls++; if (p & 1) nv++; if (p & 2) nf++;
+      if (d) { calls++; nv += vblanks; if (p & 2) nf++;
                if ((calls % 20000) == 0)
                    fprintf(stderr, "[gcm-pump] calls=%u vblank=%u flip=%u vcount=%u%c",
                            calls, nv, nf, s_vblank_count, 10); } }
-    if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
-        ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
-        g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
-                           0, 0, 0, 0, 0, 0, 0);
+    if (s_vblank_handler_opd && g_ps3_guest_caller) {
+        const u32 last = s_vblank_count;
+        for (u32 i = 0; i < vblanks; i++) {
+            ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
+            g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)(last - (vblanks - 1u - i)),
+                               0, 0, 0, 0, 0, 0, 0);
+        }
     }
     if (p & 2) {
         s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
@@ -736,9 +748,7 @@ void ppu_gcm_pump(void)
     GCM_PUMP_LEAVE();
 }
 
-/* Back-compat: the old direct entry points now just mark a tick pending (so any
- * caller other than the ticker still works) -- delivery stays on the main thread. */
-void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
+void cellGcmTickVBlank(void) { s_vblank_count++; GCM_VBLANK_QUEUE(); GCM_PENDING_SET(1); }
 /* Only deliver a flip completion when a flip is actually outstanding.
  *
  * Ticking unconditionally at 60 Hz fires the guest's flip handler even when

@@ -1,0 +1,66 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) buffer Ring { uint data[]; } ring;
+layout(push_constant) uniform Params {
+    uint src, dst, width, height, pitch, sbpp, dbpp, format, swizzled, rgba;
+} p;
+
+uint byte_at(uint offset) {
+    return (ring.data[p.src + offset / 4] >> ((offset & 3) * 8)) & 255;
+}
+uint address(uint pixel) {
+    uint x = pixel % p.width, y = pixel / p.width;
+    if (p.swizzled == 0) return y * p.pitch + x * p.sbpp;
+    uint w = p.width, h = p.height, off = 0, shift = 0;
+    while (w > 1 && h > 1) {
+        off |= (x & 1) << shift++; x >>= 1; w >>= 1;
+        off |= (y & 1) << shift++; y >>= 1; h >>= 1;
+    }
+    return (off | ((x | y) << shift)) * p.sbpp;
+}
+uint output_byte(uint i) {
+    uint pixel = i / p.dbpp, channel = i % p.dbpp;
+    uint a = address(pixel), f = p.format;
+    if (f == 0x85 || f == 0x9e) {
+        if (f == 0x9e && channel == 3) return 255;
+        return byte_at(a + (p.rgba != 0 ? channel : ((channel + 1) & 3)));
+    }
+    if (f == 0x82 || f == 0x83 || f == 0x84 || f == 0x97 || f == 0x9d) {
+        uint v = (byte_at(a) << 8) | byte_at(a + 1);
+        if (f == 0x83) {
+            uint shift = channel == 3 ? 12 : 8 - 4 * channel;
+            return ((v >> shift) & 15) * 17;
+        }
+        if (channel == 3) {
+            if (f == 0x84 || f == 0x9d) return 255;
+            return (v & (f == 0x97 ? 1 : 0x8000)) != 0 ? 255 : 0;
+        }
+        if (f == 0x84) {
+            uint shift = channel == 0 ? 11 : channel == 1 ? 5 : 0;
+            uint mask = channel == 1 ? 63 : 31;
+            return ((v >> shift) & mask) * 255 / mask;
+        }
+        uint shift = (2 - channel) * 5 + (f == 0x97 ? 1 : 0);
+        return ((v >> shift) & 31) * 255 / 31;
+    }
+    if (f == 0x90) {
+        uint depth = (byte_at(a) << 16) | (byte_at(a + 1) << 8) | byte_at(a + 2);
+        uint msb = depth == 0 ? 0 : uint(findMSB(depth));
+        uint mantissa = depth << (23 - msb);
+        uint bits = depth == 0 ? 0 : ((msb + 103) << 23) + mantissa - (1 << 23) + 1;
+        return (bits >> (channel * 8)) & 255;
+    }
+    if (f == 0x92 || f == 0x94 || f == 0x95 || f == 0x9a || f == 0x9f)
+        return byte_at(a + (channel ^ 1));
+    if (f == 0x9b || f == 0x9c)
+        return byte_at(a + (channel ^ 3));
+    return byte_at(a + channel);
+}
+void main() {
+    uint i = (gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64) * 4;
+    uint size = p.width * p.height * p.dbpp;
+    if (i >= size) return;
+    uint word = 0;
+    for (uint b = 0; b < 4 && i + b < size; b++) word |= output_byte(i + b) << (b * 8);
+    ring.data[p.dst + i / 4] = word;
+}

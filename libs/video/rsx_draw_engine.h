@@ -228,6 +228,9 @@ typedef struct rsx_draw_backend {
      * DEPTH16); left NULL, such a texture reads guest memory as it is. */
     int  (*depth_readback)(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
                            float* out, u32 out_pitch);
+    int  (*texture_upload_guest)(void* user, u32 texture, u32 face, u32 mip,
+                                 u32 w, u32 h, const u8* src,
+                                 const rsx_tex_layout* layout);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

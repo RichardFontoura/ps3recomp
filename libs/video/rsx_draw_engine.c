@@ -1030,6 +1030,12 @@ static int eng_texture_fill(u32 handle, u32 location, u32 offset, u32 fmt, u32 w
         const u8* face = src + (size_t)f * face_stride;
         for (u32 m = 0; m < nlv; m++) {
             const rsx_tex_layout* tl = &lv[m].tl;
+            if (g.be->texture_upload_guest) {
+                const int uploaded = g.be->texture_upload_guest(g.be->user, handle,
+                    f, m, lv[m].w, lv[m].h, face + lv[m].offset, tl);
+                if (uploaded < 0) return 0;
+                if (uploaded) continue;
+            }
             if (!eng_staging_reserve(tl->dst_row_bytes * tl->rows)) return 0;
             rsx_texture_decode(g.tex_staging, tl->dst_row_bytes,
                                face + lv[m].offset, lv[m].w, lv[m].h, tl,

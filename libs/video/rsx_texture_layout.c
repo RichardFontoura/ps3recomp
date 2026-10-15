@@ -156,6 +156,19 @@ int rsx_texture_argb_is_rgba(void)
     return cached;
 }
 
+void rsx_texture_raw_argb_remap(u32 control1, u32 rsx_fmt, int argb_as_rgba, u8 out[4])
+{
+    if (!out) return;
+    rsx_texture_component_remap(control1, rsx_fmt, out);
+    for (u32 i = 0; i < 4; i++) {
+        if (out[i] >= 4) continue;
+        if ((rsx_fmt & 0x9Fu) == 0x9Eu && out[i] == 3)
+            out[i] = RSX_REMAP_ONE;
+        else if (!argb_as_rgba)
+            out[i] = (out[i] + 1u) & 3u;
+    }
+}
+
 /* A 5- or 6-bit field widened to 8 bits, and a 4-bit one, exactly as the live
  * draw engine's decode_texel widens them. */
 static u8 expand5(u32 v) { return (u8)(v * 255u / 31u); }

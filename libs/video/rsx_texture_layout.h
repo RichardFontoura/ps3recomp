@@ -206,6 +206,8 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
  * not, which is precisely that regression. */
 void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4]);
 
+void rsx_texture_raw_argb_remap(u32 control1, u32 rsx_fmt, int argb_as_rgba, u8 out[4]);
+
 /* TEX_RGBA: treat A8R8G8B8 source bytes as already R,G,B,A and copy them
  * straight through.
  *

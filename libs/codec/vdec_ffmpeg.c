@@ -113,9 +113,13 @@ VdecFf* vdec_ff_open(u32 codec_type)
     d->pkt = ff->av_packet_alloc();
     d->frame = ff->av_frame_alloc();
     if (d->ctx) {
-        /* One thread: pictures come out of the call that decoded them (or
-         * the next ones, for reordering) rather than a frame-thread later. */
         d->ctx->thread_count = 1;
+        const char* threads = getenv("VDEC_THREADS");
+        if (threads) {
+            int n = atoi(threads);
+            if (n >= 1 && n <= 16) d->ctx->thread_count = n;
+        }
+        d->ctx->thread_type = FF_THREAD_SLICE;
     }
     if (!d->ctx || !d->pkt || !d->frame || ff->avcodec_open2(d->ctx, codec, NULL) < 0) {
         printf("[cellVdec] could not open the libavcodec decoder\n");

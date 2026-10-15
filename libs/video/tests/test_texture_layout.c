@@ -720,8 +720,35 @@ static void test_remap_rejects_null(void)
     rsx_texture_component_remap(0xAAE4u, FMT_A8R8G8B8, NULL);   /* must not crash */
 }
 
+static void test_raw_argb_remap(void)
+{
+    const u8 raw[4] = { 37, 83, 149, 211 };
+    for (int rgba = 0; rgba < 2; rgba++) {
+        for (u32 f = 0; f < 2; f++) {
+            const u32 fmt = (f ? 0x9Eu : 0x85u) | 0x20u;
+            rsx_tex_layout tl;
+            rsx_texture_layout(fmt, 1, 1, &tl);
+            u8 decoded[4];
+            rsx_texture_decode(decoded, 4, raw, 1, 1, &tl, rgba);
+            for (u32 crossbar = 0; crossbar < 65536; crossbar++) {
+                u8 canonical[4], direct[4];
+                rsx_texture_component_remap(crossbar, fmt, canonical);
+                rsx_texture_raw_argb_remap(crossbar, fmt, rgba, direct);
+                for (u32 c = 0; c < 4; c++) {
+                    u8 a = canonical[c] < 4 ? decoded[canonical[c]] :
+                           canonical[c] == RSX_REMAP_ONE ? 255 : 0;
+                    u8 b = direct[c] < 4 ? raw[direct[c]] :
+                           direct[c] == RSX_REMAP_ONE ? 255 : 0;
+                    CHECK_EQ(a, b);
+                }
+            }
+        }
+    }
+}
+
 int main(void)
 {
+    test_raw_argb_remap();
     test_argb();
     test_g8b8();
     test_compressed();

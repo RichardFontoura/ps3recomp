@@ -21,6 +21,8 @@ ps3_guest_caller_fn g_ps3_guest_caller;
 static unsigned calls;
 static uint32_t last;
 static atomic_int paused, resume_pump;
+static unsigned vblank_calls;
+static uint64_t vblank_args[16];
 static void* pump_thread(void* unused)
 {
     (void)unused; ppu_gcm_pump(); return NULL;
@@ -34,6 +36,7 @@ static void callback(uint32_t opd, uint64_t a, uint64_t b, uint64_t c,
         return;
     }
     if (opd == 0x200) { cellGcmQueueUserCommand(0xDD); return; }
+    if (opd == 0x400) { vblank_args[vblank_calls++ % 16] = a; return; }
     assert(opd == 0x100 && !b && !c && !d && !e && !f && !h && !i);
     calls++; last = (uint32_t)a;
     if (a == 0xAA) { cellGcmQueueUserCommand(0xBB); ppu_gcm_pump(); }
@@ -81,5 +84,16 @@ int main(void)
     ppu_gcm_pump(); assert(calls == 7);
     cellGcmSetUserHandler(NULL);
     cellGcmQueueUserCommand(7); ppu_gcm_pump(); assert(calls == 7);
+    s_vblank_handler_opd = 0x400;
+    for (int i = 0; i < 3; i++) cellGcmTickVBlank();
+    ppu_gcm_pump();
+    assert(vblank_calls == 3);
+    assert(vblank_args[0] + 1 == vblank_args[1] && vblank_args[1] + 1 == vblank_args[2]);
+    assert(vblank_args[2] == s_vblank_count);
+    ppu_gcm_pump(); assert(vblank_calls == 3);
+    for (int i = 0; i < 20; i++) cellGcmTickVBlank();
+    ppu_gcm_pump(); assert(vblank_calls == 3 + GCM_VBLANK_BURST_MAX);
+    ppu_gcm_pump(); assert(vblank_calls == 3 + GCM_VBLANK_BURST_MAX);
+    s_vblank_handler_opd = 0;
     puts("Deferred GCM user-command checks passed");
 }

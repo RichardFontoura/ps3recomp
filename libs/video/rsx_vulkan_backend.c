@@ -93,7 +93,7 @@
     X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) \
     X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkResetDescriptorPool) \
     X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
-    X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
+    X(vkCreateGraphicsPipelines) X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkDestroyPipeline) \
     X(vkCreateSampler) X(vkDestroySampler) \
     X(vkCmdPipelineBarrier) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) \
     X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImage) \
@@ -639,7 +639,7 @@ static int vk_batch_ring(void)
     if (vk_create_host_buffer(&s_vb.ring, VK_BATCH_RING_BYTES,
                               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                               VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                              VK_BUFFER_USAGE_TRANSFER_DST_BIT) ||
+                              VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
         !s_vb.ring.coherent) {
         vk_destroy_buffer(&s_vb.ring);
         VK_LOG("no host-coherent memory for the command batch ring\n");
@@ -2281,6 +2281,7 @@ typedef struct vk_eng_obj {
     u32      block;                  /* bytes per 4x4 block, 0 = not BC     */
     u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
     u8       cube;                   /* TEXTURE: six layers, a CUBE view    */
+    u8       raw_argb;
 } vk_eng_obj;
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
@@ -2831,6 +2832,22 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     const u32 hd = vk_eng_alloc();
     if (!hd) return 0;
     vk_eng_obj* o = &s_eobj[hd];
+    static int raw_enabled = -1;
+    if (raw_enabled < 0) {
+        const char* e = getenv("RSX_VK_RAW_TEXTURES");
+        raw_enabled = !e || atoi(e) != 0;
+    }
+    const u32 base = rsx_fmt & 0x9Fu;
+    o->raw_argb = raw_enabled && (rsx_fmt & 0x20u) &&
+                  (base == 0x85u || base == 0x9Eu) && fmt == RSX_BE_FMT_R8G8B8A8;
+    o->rsx_fmt = rsx_fmt;
+    VkComponentMapping mapping = vk_remap(remap, rsx_fmt);
+    if (o->raw_argb) {
+        u8 sel[4];
+        rsx_texture_raw_argb_remap(remap, rsx_fmt, rsx_texture_argb_is_rgba(), sel);
+        mapping = (VkComponentMapping){ vk_remap_sel(sel[1]), vk_remap_sel(sel[2]),
+                                        vk_remap_sel(sel[3]), vk_remap_sel(sel[0]) };
+    }
     VkImageCreateInfo ici = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0, .imageType = VK_IMAGE_TYPE_2D,
@@ -2848,7 +2865,7 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
                                  .allocationSize = req.size, .memoryTypeIndex = type };
     if (vk_image_alloc(&o->im, &mai) ||
         pvkBindImageMemory(s_vk.device, o->im.img, o->im.mem, 0) != VK_SUCCESS ||
-        vk_eng_make_view(o->im.img, vf, mips, vk_remap(remap, rsx_fmt), cube, &o->im.view))
+        vk_eng_make_view(o->im.img, vf, mips, mapping, cube, &o->im.view))
         goto fail;
     o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h; o->cube = (u8)cube;
     o->bpp = bc ? 0 : bpp; o->block = bc ? bpp : 0;
@@ -2871,7 +2888,46 @@ static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u3
     if (!o || !src || !row_bytes || !rows || face >= (o->cube ? 6u : 1u)) return;
     /* A BC row is a row of 4x4 blocks; the engine's `rows` already counts them. */
     const size_t tight = o->block ? (size_t)((w + 3u) / 4u) * o->block : (size_t)w * o->bpp;
+    if (o->raw_argb && !rsx_texture_argb_is_rgba()) {
+        u8* raw = (u8*)malloc(tight * rows);
+        if (!raw) return;
+        for (u32 y = 0; y < rows; y++) {
+            const u8* s = (const u8*)src + (size_t)y * row_bytes;
+            u8* d = raw + (size_t)y * tight;
+            for (u32 x = 0; x < w; x++, s += 4, d += 4) {
+                d[0] = s[3]; d[1] = s[0]; d[2] = s[1]; d[3] = s[2];
+            }
+        }
+        vk_eng_upload_rows(o->im.img, face, mip, w, h, tight, rows, raw, (u32)tight);
+        free(raw);
+        return;
+    }
     vk_eng_upload_rows(o->im.img, face, mip, w, h, tight, rows, src, row_bytes);
+}
+
+#include "vulkan/rsx_vk_texture_compute.h"
+
+static int vk_eng_texture_upload_guest(void* user, u32 texture, u32 face, u32 mip,
+                                       u32 w, u32 h, const u8* src,
+                                       const rsx_tex_layout* tl)
+{
+    (void)user;
+    vk_eng_obj* o = vk_eng_get(texture, VK_ENG_TEXTURE);
+    if (!o || !src || !tl || face >= (o->cube ? 6u : 1u)) return -1;
+    if (tl->swizzled || (!o->raw_argb && !tl->compressed &&
+        tl->fmt != RSX_TEXFMT_R8 && tl->fmt != RSX_TEXFMT_R8G8)) {
+        if ((u64)tl->dst_row_bytes * tl->rows < 16384u) return 0;
+        VkDeviceSize offset;
+        int result = vk_texture_compute(src, w, h, tl, &offset);
+        if (result <= 0) return result;
+        vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        VkBufferImageCopy region = { .bufferOffset = offset,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, face, 1 }, .imageExtent = { w, h, 1 } };
+        pvkCmdCopyBufferToImage(s_vk.cmd, s_vb.ring.buf, o->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        return vk_end_op() == 0 ? 1 : -1;
+    }
+    return vk_eng_upload_rows(o->im.img, face, mip, w, h, tl->dst_row_bytes,
+                               tl->rows, src, tl->row_bytes) == 0 ? 1 : -1;
 }
 
 /* A colour target sampled with a unit's crossbar: an extra view of the same
@@ -3722,6 +3778,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .shutdown             = vk_eng_shutdown,
     .submit_and_wait      = vk_eng_submit_and_wait,
     .texture_create       = vk_eng_texture_create,
+    .texture_upload_guest = vk_eng_texture_upload_guest,
     .texture_upload       = vk_eng_texture_upload,
     .texture_release      = vk_eng_release,
     .color_target_create  = vk_eng_color_target_create,
@@ -3939,6 +3996,10 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 
 void rsx_vulkan_backend_shutdown(void)
 {
+    if (s_vk.device) {
+        vk_flush();
+        vk_texture_compute_shutdown();
+    }
     if (rsx_get_backend() == &s_vulkan_backend) rsx_set_backend(NULL);
     if (s_vk.eng_active) { rsx_draw_engine_shutdown(); s_vk.eng_active = 0; }
     rsx_draw_engine_set_backend(NULL);
