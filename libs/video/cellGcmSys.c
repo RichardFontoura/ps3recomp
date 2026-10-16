@@ -2027,18 +2027,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
-                /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
-                 * splits into subchannel 7 / method 0x0B00 -- so it was landing
-                 * in the 2D engine path and being dropped as unrecognised. It
-                 * is not a 2D method at all: it tells the RSX to raise a
-                 * USER_CMD interrupt, which is what ps1_netemu's flip path
-                 * blocks on. */
                 { static int sd = -1; static unsigned long s7 = 0;
                   if (sd < 0) sd = getenv("GCM_SUBCH7") ? 1 : 0;
                   if (sd && subch == 7 && (s7++ < 16))
                       fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
                               m, vm_read32(dea)); }
-                if (subch == 7 && m == 0x0B00u) {
+                if (subch == 7 && m == 0x0B00u && s_gcm_syscall_mode) {
                     extern void rsx_raise_user_cmd(u32 arg);
                     rsx_raise_user_cmd(vm_read32(dea));
                     continue;

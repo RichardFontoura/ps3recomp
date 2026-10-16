@@ -385,6 +385,14 @@ jobs:
             -o /tmp/test_gcm_io_map
           /tmp/test_gcm_io_map
 
+      - name: GCM FIFO user command reaches the HLE user handler
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I libs/video \
+            libs/video/tests/test_gcm_user_command_fifo.c runtime/trace/ps3_timeline.c -pthread \
+            -ffunction-sections -fdata-sections -Wl,--gc-sections \
+            -o /tmp/test_gcm_user_command_fifo
+          /tmp/test_gcm_user_command_fifo
+
       - name: NV3089 blits stay inside the guest memory regions
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I libs/video \
