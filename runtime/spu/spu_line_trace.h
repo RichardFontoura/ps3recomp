@@ -9,8 +9,10 @@ extern "C" {
 
 enum {
     SPU_LINE_TRACE_GETLLAR = 1, SPU_LINE_TRACE_PUTLLC_OK, SPU_LINE_TRACE_PUTLLC_FAIL,
-    SPU_LINE_TRACE_PUT, SPU_LINE_TRACE_PPU_CAS, SPU_LINE_TRACE_PPU_STORE
+    SPU_LINE_TRACE_PUT, SPU_LINE_TRACE_PPU_CAS, SPU_LINE_TRACE_PPU_STORE, SPU_LINE_TRACE_GET
 };
+
+#define SPU_LINE_TRACE_RING 65536u
 
 typedef struct spu_line_trace_entry {
     uint64_t ns;
@@ -23,12 +25,18 @@ extern uint32_t g_spu_line_trace_ea;
 extern uint32_t g_spu_line_trace_n;
 extern uint32_t g_spu_line_trace_eas[32];
 int spu_line_trace_hit(uint32_t ea, uint32_t size);
-extern spu_line_trace_entry g_spu_line_trace[4096];
+extern spu_line_trace_entry g_spu_line_trace[SPU_LINE_TRACE_RING];
 extern volatile uint32_t g_spu_line_trace_seq;
+extern uint32_t g_spu_wws_check_q;
 
 void spu_line_trace_init(void);
 void spu_line_trace_note(uint32_t kind, uint32_t ea, uint32_t size, const void* actor,
                          uint32_t pc, uint32_t lr, uint32_t spu_num);
+void spu_line_trace_note_data(uint32_t kind, uint32_t ea, uint32_t size, const void* actor,
+                              uint32_t pc, uint32_t lr, uint32_t spu_num, const uint8_t* line);
+void spu_wws_check_claim(const void* ctx, uint32_t ea, const uint8_t* old_line,
+                         const uint8_t* new_line);
+void spu_wws_check_skip(const void* ctx, uint32_t lsa, uint32_t ea, uint32_t size);
 #define SPU_LINE_TRACE_SPUNUM(c) \
     (((uint32_t)(c)->ls[0x1C8] << 24) | ((uint32_t)(c)->ls[0x1C9] << 16) | \
      ((uint32_t)(c)->ls[0x1CA] << 8) | (uint32_t)(c)->ls[0x1CB])

@@ -663,6 +663,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
+            if (g_spu_wws_check_q && (ea & ~127u) == g_spu_wws_check_q)
+                spu_wws_check_claim(ctx, ea, ctx->resv_line, ls);
             /* A committing PUTLLC is a line write like any other, so every
              * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
              * Silent, this is the same lost update the PPU half was added to

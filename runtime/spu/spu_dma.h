@@ -411,6 +411,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * so a garbage EA (e.g. from an incomplete SPURS context) is a failed DMA
      * rather than a host segfault. */
     if (!mfc_ea_range_committed(ea, size)) {
+        if (g_spu_wws_check_q) spu_wws_check_skip(spu, lsa, (uint32_t)ea, size);
         static int s_warned = 0;
         if (s_warned++ < 32)
             fprintf(stderr, "[spu-dma] SKIP %s img=%d pc=0x%05X lsa=0x%05X ea=0x%08X "
@@ -589,8 +590,18 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                               lsa, (uint32_t)ea, size, (uint32_t)spu->pc, spu->image_id, "\n");
               }
           } }
-        /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
+        if (SPU_LINE_TRACE_HIT(ea, size)) {
+            if (((uint32_t)ea & 127u) == 0 && size == 128u)
+                spu_line_trace_note_data(SPU_LINE_TRACE_GET, (uint32_t)ea, size, spu,
+                                         (uint32_t)spu->pc & SPU_LS_MASK,
+                                         spu->gpr[0]._u32[0] & SPU_LS_MASK,
+                                         SPU_LINE_TRACE_SPUNUM(spu), (const uint8_t*)ls_ptr);
+            else
+                spu_line_trace_note(SPU_LINE_TRACE_GET, (uint32_t)ea, size, spu,
+                                    (uint32_t)spu->pc & SPU_LS_MASK,
+                                    spu->gpr[0]._u32[0] & SPU_LS_MASK, SPU_LINE_TRACE_SPUNUM(spu));
+        }
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
         { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
