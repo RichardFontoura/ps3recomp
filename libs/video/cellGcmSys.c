@@ -152,6 +152,8 @@ static u16 s_io_address_table[65536];
 static u16 s_ea_address_table[65536];
 
 #define GCM_OFFSET_TABLE_PAGES   4096u                 /* 4 GiB / 1 MiB       */
+#define GCM_IO_SPACE_BYTES       0x10000000u
+#define GCM_IO_ALLOC_FAILED      0xFFFFFFFFu
 #define GCM_OFFSET_TABLE_IO_ADDR (VM_HLE_INJECT_BASE + 0x3000u)           /* ea >> 20  -> io>>20 */
 #define GCM_OFFSET_TABLE_EA_ADDR (VM_HLE_INJECT_BASE + 0x5000u)           /* io >> 20  -> ea>>20 */
 
@@ -2785,6 +2787,11 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     if (address < auto_map_limit) {
         u32 ea_page = address & ~0xFFFFFu;
         u32 io      = gcm_io_alloc(0x100000u);
+        if (io == GCM_IO_ALLOC_FAILED) {
+            printf("[cellGcmSys] AddressToOffset: no free IO page to auto-map ea 0x%08X\n", address);
+            vm_write32(off_ea, 0);
+            return CELL_GCM_ERROR_NO_IO_PAGE_TABLE;
+        }
         populate_offset_table(ea_page, io, 0x100000u);
         /* Record it in the mapping list too, not just the offset table.
          *
@@ -2819,21 +2826,16 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     return CELL_GCM_ERROR_FAILURE;
 }
 
-/* IO-offset space bump allocator for main-memory mappings. Starts PAST the
- * Init command-buffer region: handing out io 0 (the old s_local_mem_allocated
- * bump, which begins at 0) remapped the FIFO's own io page -- demosaic's
- * cellGcmMapMainMemory(sys heap) got offset 0, io2ea(0) then resolved into its
- * heap (all zeros) and the RSX walker consumed every frame's commands as
- * no-ops (no draws, label fence never written, guest waited forever). */
-static u32 s_io_alloc_next = 0;
 static u32 gcm_io_alloc(u32 size)
 {
-    if (s_io_alloc_next == 0)
-        s_io_alloc_next = (s_config.ioSize + 0xFFFFFu) & ~0xFFFFFu;
-    if (s_io_alloc_next < 0x100000u) s_io_alloc_next = 0x100000u;
-    u32 io = s_io_alloc_next;
-    s_io_alloc_next += (size + 0xFFFFFu) & ~0xFFFFFu;
-    return io;
+    const u32 pages = (size + 0xFFFFFu) >> 20;
+    const u32 end = (GCM_IO_SPACE_BYTES - s_io_map_reserved) >> 20;
+    u32 run = 0;
+    for (u32 io = 0; pages && io < end && io < GCM_OFFSET_TABLE_PAGES; io++) {
+        run = s_ea_address_table[io] == 0xFFFF ? run + 1 : 0;
+        if (run == pages) return (io + 1 - pages) << 20;
+    }
+    return GCM_IO_ALLOC_FAILED;
 }
 
 /* NID: 0x2A6FBA9C */
@@ -2862,13 +2864,15 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
         return CELL_GCM_ERROR_INVALID_ALIGNMENT;
     }
 
-    /* Allocate a fresh IO region past the Init command-buffer window. */
-    u32 io_offset = gcm_io_alloc(size);
-
     IoMapping* mapping = find_free_mapping();
     if (!mapping) {
         printf("[cellGcmSys] WARNING: no free IO mapping slots\n");
         return CELL_GCM_ERROR_FAILURE;
+    }
+    u32 io_offset = gcm_io_alloc(size);
+    if (io_offset == GCM_IO_ALLOC_FAILED) {
+        printf("[cellGcmSys] MapMainMemory REFUSED: no 0x%X bytes of free IO space\n", size);
+        return CELL_GCM_ERROR_NO_IO_PAGE_TABLE;
     }
 
     mapping->ea     = ea;

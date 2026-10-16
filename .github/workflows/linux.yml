@@ -377,6 +377,14 @@ jobs:
             -o /tmp/test_gcm_flip_fifo
           /tmp/test_gcm_flip_fifo
 
+      - name: GCM IO mappings reuse freed IO pages first-fit
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I libs/video \
+            libs/video/tests/test_gcm_io_map.c runtime/trace/ps3_timeline.c -pthread \
+            -ffunction-sections -fdata-sections -Wl,--gc-sections \
+            -o /tmp/test_gcm_io_map
+          /tmp/test_gcm_io_map
+
       - name: NV3089 blits stay inside the guest memory regions
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I libs/video \
