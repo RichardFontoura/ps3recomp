@@ -85,6 +85,7 @@ extern u32 ppu_vm_size;
 #define M_DEPTH_FUNC          0x0A6C
 #define M_DEPTH_WRITE         0x0A70
 #define M_DEPTH_TEST_ENABLE   0x0A74
+#define M_SHADER_WINDOW       0x1D88
 #define M_ZSTENCIL_CLEAR      0x1D8C
 #define M_CONTROL0            0x03B0
 
@@ -2551,8 +2552,6 @@ static void sink_end(void* user, const rsx_dispatch* r)
     memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
     memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
 
-    /* The buffered fragment constants, then fp_alpha: the layout
-     * rsx_fp_decompile_buffered_ex compiled the shader against. */
     const u32 nslots = g.fp_constants.count ? g.fp_constants.count : 1u;
     const u32 fp_bytes = (nslots + 1u) * 16u;
     if (g.fp_cb_cap < fp_bytes) {
@@ -2566,7 +2565,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
         memcpy(g.fp_cb, g.fp_constants.values, g.fp_constants.count * 16u);
     { float* alpha = (float*)(g.fp_cb + nslots * 16u);
       alpha[0] = rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format);
-      alpha[1] = alpha[2] = alpha[3] = 0.0f; }
+      rsx_fp_wpos_params(rsx_dsp_reg(&g.rsx, M_SHADER_WINDOW), alpha + 1); }
 
     pd_note(targets, n_targets, zslot, &rs, pipeline, tex_mask);
     pd_note_vertices(&layout, n_draw, tex_mask);

@@ -94,6 +94,7 @@ typedef struct {
     u32 last_released;
     float last_clear_depth;
     int n_depth_readback;
+    float ps_tail[4];
 } StubState;
 
 static StubState stub;
@@ -191,7 +192,12 @@ static void stub_bind_targets(void* u, const u32* s, u32 count, u32 d)
 }
 static void stub_bind_pipeline(void* u, u32 p) { (void)u; stub.bound_pipeline = p; }
 static void stub_bind_vs(void* u, const void* d, u32 n) { (void)u; (void)d; (void)n; }
-static void stub_bind_ps(void* u, const void* d, u32 n) { (void)u; (void)d; (void)n; }
+static void stub_bind_ps(void* u, const void* d, u32 n)
+{
+    (void)u;
+    if (d && n >= sizeof stub.ps_tail)
+        memcpy(stub.ps_tail, (const u8*)d + n - sizeof stub.ps_tail, sizeof stub.ps_tail);
+}
 
 static void stub_bind_textures(void* u, const u32* tex,
                                const rsx_be_sampler_desc* smp, u32 mask)
@@ -392,6 +398,7 @@ static rsx_draw_backend g_stub_backend = {
 #define M_COLOR_B_OFFSET      0x0218
 #define M_COLOR_TARGET        0x0220
 #define M_CONTEXT_DMA_ZETA    0x0198
+#define M_SHADER_WINDOW       0x1D88
 #define M_ZSTENCIL_CLEAR      0x1D8C
 #define M_ZETA_PITCH          0x022C
 #define M_COLOR_MASK          0x0324
@@ -1098,6 +1105,31 @@ static void test_scissor(void)
     engine_down();
 }
 
+static void test_shader_window(void)
+{
+    printf("-- shader window\n");
+    engine_up();
+
+    draw_triangle();
+    CHECK(stub.ps_tail[1] == 1.0f && stub.ps_tail[2] == 0.0f && stub.ps_tail[3] == 0.0f,
+          "an unwritten SHADER_WINDOW is the reset value 0x1000, origin bottom (%g %g %g)",
+          stub.ps_tail[1], stub.ps_tail[2], stub.ps_tail[3]);
+
+    m(M_SHADER_WINDOW, 0x1000u | 256u);
+    draw_triangle();
+    CHECK(stub.ps_tail[1] == 1.0f && stub.ps_tail[2] == 256.0f && stub.ps_tail[3] == 0.0f,
+          "origin bottom reaches the fragment constants with the window height (%g %g %g)",
+          stub.ps_tail[1], stub.ps_tail[2], stub.ps_tail[3]);
+
+    m(M_SHADER_WINDOW, 0x10000u | 256u);
+    draw_triangle();
+    CHECK(stub.ps_tail[1] == 0.0f && stub.ps_tail[2] == 256.0f && stub.ps_tail[3] == -0.5f,
+          "origin top with integer centres keeps y and moves the centre (%g %g %g)",
+          stub.ps_tail[1], stub.ps_tail[2], stub.ps_tail[3]);
+
+    engine_down();
+}
+
 /* ---- 8. the presented pixel ---------------------------------------------- */
 
 static void test_readback(void)
@@ -1445,6 +1477,7 @@ int main(void)
     test_restart_expansion();
     test_indexed_draws();
     test_scissor();
+    test_shader_window();
     test_readback();
     test_custom_guest_mapping();
     test_queued_flip_buffer();

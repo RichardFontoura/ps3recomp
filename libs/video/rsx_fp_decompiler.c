@@ -60,6 +60,8 @@
 #define FP_COND_SWZ_SHIFT   21          /* X@21 Y@23 Z@25 W@27, 2 bits each */
 #define FP_COND_MOD_REG     (1u << 30)  /* set_cond WRITE target: cc0/cc1     */
 #define FP_COND_REG         (1u << 31)  /* exec_if READ source:   cc0/cc1     */
+#define FP_WINDOW_ORIGIN_BOTTOM        1u
+#define FP_WINDOW_PIXEL_CENTER_INTEGER 1u
 
 /* ---- Opcodes ------------------------------------------------------------ */
 enum {
@@ -330,22 +332,19 @@ static void decode_src(u32 w, int abs_bit, Src* s)
     s->swz[4] = '\0';
 }
 
-/* HLSL expression for the interpolated input selected by OPDEST.INPUT_SRC.
- * The backend's passthrough VS forwards COL0/COL1/FOG/TEXCOORD0..7; WPOS maps
- * to SV_POSITION (screen-space — an approximation of the RSX window coord). */
-static const char* input_expr(u32 input_src)
+static const char* input_expr(u32 input_src, int buffered)
 {
     static const char* tc[8] = {
         "input.tc0", "input.tc1", "input.tc2", "input.tc3",
         "input.tc4", "input.tc5", "input.tc6", "input.tc7" };
     switch (input_src) {
-    case 0x0: return "input.position"; /* WPOS */
-    case 0x1: return "input.col0";     /* COL0 */
-    case 0x2: return "input.col1";     /* COL1 */
-    case 0x3: return "input.fog";      /* FOGC */
+    case 0x0: return buffered ? "rsx_wpos(input.position)" : "input.position";
+    case 0x1: return "input.col0";
+    case 0x2: return "input.col1";
+    case 0x3: return "input.fog";
     default:
-        if (input_src >= 0x4 && input_src <= 0xB) return tc[input_src - 0x4]; /* TC0..7 */
-        return "float4(0,0,0,0)";      /* TC8/TC9/FACING not plumbed */
+        if (input_src >= 0x4 && input_src <= 0xB) return tc[input_src - 0x4];
+        return "float4(0,0,0,0)";
     }
 }
 
@@ -357,7 +356,7 @@ static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
     if (s->type == FP_REG_TYPE_TEMP) {
         snprintf(base, sizeof(base), "%s[%u]", s->half ? "h" : "r", s->index);
     } else if (s->type == FP_REG_TYPE_INPUT) {
-        snprintf(base, sizeof(base), "%s", input_expr(input_src));
+        snprintf(base, sizeof(base), "%s", input_expr(input_src, buffered));
     } else { /* CONST */
         if (buffered && has_k)
             snprintf(
@@ -947,6 +946,9 @@ static int rsx_fp_decompile_internal(
             "};\n",
             buffered_constant_count ? buffered_constant_count : 1u);
         out_puts(&p, constants_decl);
+        out_puts(&p,
+            "float4 rsx_wpos(float4 p) { return float4(p.x + fp_alpha.w,"
+            " lerp(p.y, fp_alpha.z - p.y, fp_alpha.y) + fp_alpha.w, p.zw); }\n");
     }
     if (targets == 1) {
         out_puts(&p, "float4 main(PSInput input) : SV_TARGET {\n");
@@ -1025,6 +1027,15 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format)
         return value;
     }
     return (float)(raw & 0xFFu) / 255.0f;
+}
+
+void rsx_fp_wpos_params(u32 shader_window, float out[3])
+{
+    const u32 origin = (shader_window >> 12) & 0xFu;
+    const u32 center = (shader_window >> 16) & 0xFu;
+    out[0] = origin == FP_WINDOW_ORIGIN_BOTTOM ? 1.0f : 0.0f;
+    out[1] = (float)(shader_window & 0xFFFu);
+    out[2] = center == FP_WINDOW_PIXEL_CENTER_INTEGER ? -0.5f : 0.0f;
 }
 
 /* The comparison the alpha test has to pass. The alpha it tests is colour

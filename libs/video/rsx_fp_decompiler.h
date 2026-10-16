@@ -85,6 +85,8 @@ int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref);
  * half float and X32/W32Z32Y32X32 use a 32-bit float. */
 float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
 
+void rsx_fp_wpos_params(u32 shader_window, float out[3]);
+
 /* Scale texel-space (RSX_TEX_FMT_UNNORM) coordinates into HLSL's 0..1 range.
  * unnorm_mask selects the units; dim[u] gives that unit's {width, height};
  * cube units are skipped. Returns the number of Sample sites patched, or -1 if

@@ -170,6 +170,7 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * as numbering oracle). Seeded so a raw register read is trustworthy for
      * clear consumers, mirroring COLOR_MASK/FRONT_FACE above. */
     rsx->regs[0x1D8C >> 2] = 0xFFFFFF00u;
+    rsx->regs[0x1D88 >> 2] = 0x1000u;
 
     /* Execution methods */
     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);

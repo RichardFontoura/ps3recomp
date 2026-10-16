@@ -189,6 +189,43 @@ int main(void)
         check("tex_coord",  hlsl, "input.tc0");
     }
 
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(0) | TEXU(0) | END);
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("wpos_literal", hlsl, "(input.position).xyzw");
+        check_absent("wpos_literal_no_window", hlsl, "rsx_wpos");
+        u32 nk = 0;
+        rsx_fp_decompile_buffered_ex(prog, sizeof(prog), CTRL_32BIT, 0,
+                                     hlsl, sizeof(hlsl), &nk);
+        check("wpos_buffered", hlsl, "(rsx_wpos(input.position)).xyzw");
+        check("wpos_helper", hlsl,
+              "float4 rsx_wpos(float4 p) { return float4(p.x + fp_alpha.w,"
+              " lerp(p.y, fp_alpha.z - p.y, fp_alpha.y) + fp_alpha.w, p.zw); }");
+        const char* cb = strstr(hlsl, "float4 fp_alpha;");
+        const char* fn = strstr(hlsl, "float4 rsx_wpos(");
+        const char* entry = strstr(hlsl, "main(PSInput input)");
+        check_true("wpos_helper_after_cbuffer_before_main",
+                   cb && fn && entry && cb < fn && fn < entry);
+
+        float w[3];
+        rsx_fp_wpos_params(0x1000u | 720u, w);
+        check_true("wpos_bottom_half", w[0] == 1.0f && w[1] == 720.0f && w[2] == 0.0f);
+        rsx_fp_wpos_params(0x10000u | 256u, w);
+        check_true("wpos_top_integer", w[0] == 0.0f && w[1] == 256.0f && w[2] == -0.5f);
+        rsx_fp_wpos_params(0x11000u | 0xFFFu, w);
+        check_true("wpos_bottom_integer", w[0] == 1.0f && w[1] == 4095.0f && w[2] == -0.5f);
+        rsx_fp_wpos_params(0u, w);
+        check_true("wpos_top_half_is_identity", w[0] == 0.0f && w[1] == 0.0f && w[2] == 0.0f);
+        const float fy = 0.5f;
+        rsx_fp_wpos_params(0x1000u | 720u, w);
+        const float bottom_row = fy + w[0] * ((w[1] - fy) - fy) + w[2];
+        check_true("wpos_bottom_top_row_is_last", bottom_row == 719.5f);
+    }
+
     /* Test 5: negate + abs on a source (MOV r0, -|r1|). */
     {
         u8 prog[16];
