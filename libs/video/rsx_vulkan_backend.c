@@ -300,6 +300,16 @@ static struct {
 } s_vb;
 
 static struct {
+    int           merge;
+    int           open;
+    VkRenderPass  rp;
+    VkFramebuffer fb;
+    u64           opened, draws, merged;
+    u32           print_every_s;
+    u64           next_print_ns;
+} s_pass = { .merge = -1 };
+
+static struct {
     int             on, busy, pending, quit, ready_pending;
     VkQueue         queue;
     VkCommandPool   pool;
@@ -641,6 +651,37 @@ static void vk_probe_init(void)
     s_sst.next_print_ns = s_vk_probe.start_ns + (u64)s_sst.print_every_s * 1000000000ull;
 }
 
+static void vk_pass_close(void)
+{
+    if (!s_pass.open) return;
+    pvkCmdEndRenderPass(s_vk.cmd);
+    s_pass.open = 0;
+}
+
+static int vk_pass_merge_on(void)
+{
+    if (s_pass.merge < 0) {
+        const char* v = getenv("RSX_VK_PASS_MERGE");
+        s_pass.merge = !(v && v[0] == '0');
+        const char* every = getenv("RSX_VK_PASS_STATS");
+        s_pass.print_every_s = (every && atoi(every) > 0) ? (u32)atoi(every) : 0;
+        s_pass.next_print_ns = vk_probe_now() + (u64)s_pass.print_every_s * 1000000000ull;
+        VK_LOG("render pass merge %s\n", s_pass.merge ? "on" : "off");
+    }
+    return s_pass.merge;
+}
+
+static void vk_pass_stats_tick(void)
+{
+    if (!s_pass.print_every_s) return;
+    const u64 now = vk_probe_now();
+    if (now < s_pass.next_print_ns) return;
+    s_pass.next_print_ns = now + (u64)s_pass.print_every_s * 1000000000ull;
+    VK_LOG("render passes t=%.1fs: %llu passes for %llu draws, %llu draws kept in an open pass\n",
+           (now - s_vk_probe.start_ns) / 1e9, (unsigned long long)s_pass.opened,
+           (unsigned long long)s_pass.draws, (unsigned long long)s_pass.merged);
+}
+
 static u64 vk_shader_stall_ns(void)
 {
     return __atomic_load_n(&s_sst.stall_ns, __ATOMIC_RELAXED) + rsx_draw_engine_decompile_ns(NULL);
@@ -680,6 +721,7 @@ static void vk_probe_frame(u64 present_start)
         }
     }
     vk_sc_tick();
+    vk_pass_stats_tick();
     if (!s_vk_probe.csv) return;
     const u64 now = vk_probe_now();
     fprintf(s_vk_probe.csv, "%u,%.6f,%.6f,%.6f,%llu,%.6f,%u,%llu,%llu,%.6f,%.6f\n", s_vk.presented,
@@ -697,6 +739,7 @@ static void vk_probe_frame(u64 present_start)
 static int vk_begin(void)
 {
     vk_probe_init();
+    vk_pass_close();
     if (s_vb.recording) return 0;
     VK_CHECK(pvkResetCommandBuffer(s_vk.cmd, 0), "vkResetCommandBuffer");
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -752,6 +795,7 @@ static void vk_wait_slot(u32 k)
 
 static int vk_submit_current(VkSemaphore signal)
 {
+    vk_pass_close();
     s_vb.recording = 0;
     if (s_vb.queries && s_vb.timed[s_vb.slot])
         pvkCmdWriteTimestamp(s_vk.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_vb.queries,
@@ -882,10 +926,9 @@ static int vk_batch_readback(VkDeviceSize bytes)
     return vk_create_host_buffer(&s_vb.readback, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 }
 
-/* Order this command buffer's use of an image after everything submitted
- * before it; from UNDEFINED it is also the one-time move to GENERAL. */
 static void vk_barrier_image(VkImage img, VkImageAspectFlags aspect, VkImageLayout old_layout)
 {
+    vk_pass_close();
     VkImageMemoryBarrier b = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
@@ -4382,6 +4425,23 @@ static VkDescriptorSet vk_eng_write_descriptors(const vk_eng_pipe* P, VkImageVie
     return set;
 }
 
+static int vk_eng_samples_attachment(u32 n)
+{
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
+        if (!((s_e2.tex_mask >> u) & 1u)) continue;
+        const u32 hd = s_e2.tex[u];
+        if (!hd || hd >= VK_ENG_MAX_OBJ) continue;
+        const vk_eng_obj* o = &s_eobj[hd];
+        u32 surface = 0;
+        if (o->kind == VK_ENG_COLOR) surface = hd;
+        else if (o->kind == VK_ENG_VIEW && !o->im.img) surface = o->surface;
+        if (!surface) continue;
+        for (u32 i = 0; i < n; i++)
+            if (surface == s_eng_bound.rt[i]) return 1;
+    }
+    return 0;
+}
+
 static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
                         u32 stride, const u32* indices, u32 index_count)
 {
@@ -4442,13 +4502,21 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     const VkDescriptorSet set = vk_eng_write_descriptors(P, dummy_cube, vs_off, ps_off);
     if (!set) return;
 
-    if (vk_begin()) return;
-    for (u32 i = 0; i < n; i++)
-        vk_barrier_image(s_eobj[s_eng_bound.rt[i]].im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-                                  .renderPass = rp, .framebuffer = fb,
-                                  .renderArea = { { 0, 0 }, { w, h } } };
-    pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    const int merge = vk_pass_merge_on();
+    if (merge && s_pass.open && s_pass.rp == rp && s_pass.fb == fb && !vk_eng_samples_attachment(n)) {
+        s_pass.merged++;
+    } else {
+        if (vk_begin()) return;
+        for (u32 i = 0; i < n; i++)
+            vk_barrier_image(s_eobj[s_eng_bound.rt[i]].im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                      .renderPass = rp, .framebuffer = fb,
+                                      .renderArea = { { 0, 0 }, { w, h } } };
+        pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        s_pass.open = 1; s_pass.rp = rp; s_pass.fb = fb;
+        s_pass.opened++;
+    }
+    s_pass.draws++;
     pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
     if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
@@ -4477,7 +4545,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     } else {
         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
     }
-    pvkCmdEndRenderPass(s_vk.cmd);
+    if (!merge) vk_pass_close();
     s_vk_probe.draws++;
     vk_end_op();
 }
