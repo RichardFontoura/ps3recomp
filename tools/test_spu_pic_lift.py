@@ -57,6 +57,10 @@ def main():
     check('spu_ls_read128(ctx, SPU_PIC(ctx, 0x20))' in pic, 'lqr address is relative to pic_base')
     check('frag_pic_functions[]' in pic and 'frag_pic_function_count' in pic, 'PIC function table emitted')
     check('spu_register_function' not in pic, 'PIC image stays out of the address registry')
+    check('frag_pic_ranges_00000000[] = { 0x0u, 0xCu, 0x10u, 0x14u };' in pic,
+          'PIC entry validates its reachable words and its callee, not the dead word after bi')
+    check('{ 0x0u, 0x0u, 0x14u, frag_spu_func_00000000, frag_pic_ranges_00000000, 2u },' in pic,
+          'PIC entry keeps the hull and points at its ranges')
     check('SPU_PIC' not in fixed, 'fixed-address lift unchanged')
     check('spu_link(0x4)' in fixed, 'fixed-address link constant unchanged')
     print(f'SPU PIC lift: {"ok" if not failures else f"{failures} failure(s)"}')

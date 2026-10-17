@@ -398,6 +398,8 @@ typedef struct spu_context {
 typedef struct {
     uint32_t addr, lo, hi;
     void (*func)(spu_context*);
+    const uint32_t* ranges;
+    uint32_t nranges;
 } spu_pic_entry;
 
 void spu_pic_register(const spu_pic_entry* entries, unsigned count,

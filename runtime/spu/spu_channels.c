@@ -13,6 +13,7 @@
  */
 
 #include "spu_dma.h"
+#include "spu_pic_match.h"
 #include "../../include/ps3emu/log_first.h"
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
@@ -39,6 +40,8 @@ extern "C" {
 
 extern int g_spu_wws_pm_image;
 extern int g_spu_wws_job_image;
+static _Thread_local uint32_t t_smc_fallback_pc;
+
 static uint64_t spu_host_ns(void)
 {
 #ifdef _WIN32
@@ -1996,10 +1999,51 @@ void spu_pic_register(const spu_pic_entry* entries, unsigned count,
     qsort(s_pic, s_pic_count, sizeof s_pic[0], spu_pic_slot_cmp);
 }
 
+static void spu_pic_reject_trace(const spu_context* ctx, const spu_pic_entry* e, const uint8_t* code,
+                                 uint32_t ls_lo)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("SPU_PIC_REJECT_TRACE") != NULL;
+    if (!on) return;
+    enum { TRACKED = 256, PER_ENTRY = 3 };
+    static const spu_pic_entry* seen[TRACKED];
+    static unsigned printed[TRACKED];
+    AcquireSRWLockExclusive(&s_pic_capture_lock);
+    unsigned slot = 0;
+    for (; slot < TRACKED && seen[slot] && seen[slot] != e; slot++) {}
+    const int show = slot < TRACKED && printed[slot] < PER_ENTRY;
+    if (show) { seen[slot] = e; printed[slot]++; }
+    ReleaseSRWLockExclusive(&s_pic_capture_lock);
+    if (!show) return;
+    const uint32_t span = e->hi - e->lo;
+    uint32_t first = span, last = 0, count = 0;
+    for (uint32_t k = 0; k < span && ls_lo + k < SPU_LS_SIZE; k++) {
+        int checked = !e->nranges;
+        for (uint32_t r = 0; r < e->nranges && !checked; r++)
+            checked = e->lo + k >= e->ranges[2 * r] && e->lo + k < e->ranges[2 * r + 1];
+        if (checked && ctx->ls[ls_lo + k] != code[e->lo + k]) {
+            if (first == span) first = k;
+            last = k;
+            count++;
+        }
+    }
+    if (first == span) first = 0;
+    fprintf(stderr, "[pic-reject] entry=0x%05X lo=0x%05X hi=0x%05X ls_lo=0x%05X pc=0x%05X ovl=%d "
+            "mismatch=%u first=0x%05X last=0x%05X ls:",
+            e->addr, e->lo, e->hi, ls_lo, ctx->pc & SPU_LS_MASK, ctx->resident_ovl, count,
+            e->lo + first, e->lo + last);
+    const uint32_t from = first & ~15u;
+    for (uint32_t k = from; k < from + 32 && k < span && ls_lo + k < SPU_LS_SIZE; k++) fprintf(stderr, "%02X", ctx->ls[ls_lo + k]);
+    fprintf(stderr, " lift:");
+    for (uint32_t k = from; k < from + 32 && k < span; k++) fprintf(stderr, "%02X", code[e->lo + k]);
+    fputc('\n', stderr);
+}
+
 static spu_fn spu_pic_lookup(spu_context* ctx)
 {
-    static int off = -1;
+    static int off = -1, hull = -1;
     if (off < 0) off = getenv("SPU_PIC_OFF") != NULL;
+    if (hull < 0) hull = getenv("SPU_PIC_HULL") != NULL;
     if (!s_pic_count || off) return NULL;
     const uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
     if (pc + 16u > SPU_LS_SIZE) return NULL;
@@ -2011,10 +2055,12 @@ static spu_fn spu_pic_lookup(spu_context* ctx)
     }
     for (unsigned i = lo; i < s_pic_count && s_pic[i].key == key; i++) {
         const spu_pic_entry* e = s_pic[i].entry;
-        const uint32_t before = e->addr - e->lo, span = e->hi - e->lo;
-        if (pc < before || pc - before + span > SPU_LS_SIZE) continue;
-        if (memcmp(ctx->ls + (pc - before), s_pic[i].code + e->lo, span) != 0) {
+        const uint32_t before = e->addr - e->lo;
+        if (pc < before) continue;
+        if (!spu_pic_entry_matches(ctx->ls, SPU_LS_SIZE, pc, s_pic[i].code, e->addr, e->lo, e->hi,
+                                   e->ranges, hull ? 0 : e->nranges)) {
             __atomic_add_fetch(&s_pic_rejects, 1, __ATOMIC_RELAXED);
+            spu_pic_reject_trace(ctx, e, s_pic[i].code, pc - before);
             continue;
         }
         __atomic_add_fetch(&s_pic_hits, 1, __ATOMIC_RELAXED);
@@ -2059,27 +2105,62 @@ static int spu_smc_stats_on(void)
     return on;
 }
 
-static void spu_smc_stats_note(int image_id, uint32_t pc, int ovl, uint32_t lr, uint64_t steps,
-                               uint64_t code)
+static uint64_t spu_smc_now_ns(void)
 {
-    enum { SMC_STATS_N = 1024, SMC_STATS_TOP = 40 };
-    static _Thread_local struct { uint32_t key, ovl, lr; unsigned n; uint64_t steps, code; } tab[SMC_STATS_N];
-    static _Thread_local unsigned used, total;
-    static _Thread_local uint64_t total_steps;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void spu_smc_stats_note(int image_id, uint32_t pc, int ovl, uint32_t lr, uint64_t steps,
+                               uint64_t code, uint64_t ns, uint32_t fallback_pc)
+{
+    enum { SMC_STATS_N = 1024, SMC_STATS_TOP = 40, SMC_TIME_TOP = 16 };
+    static _Thread_local struct {
+        uint32_t key, ovl, lr, fbpc;
+        unsigned n, fb;
+        uint64_t steps, code, ns;
+    } tab[SMC_STATS_N];
+    static _Thread_local unsigned used, total, total_fb;
+    static _Thread_local uint64_t total_steps, total_ns;
     static _Thread_local time_t last;
     const uint32_t key = ((uint32_t)image_id << 20) | (pc & SPU_LS_MASK);
     unsigned i = 0;
     for (; i < used && (tab[i].key != key || tab[i].code != code); i++) {}
     if (i == used && used < SMC_STATS_N) {
         tab[used].key = key; tab[used].ovl = (uint32_t)ovl; tab[used].lr = lr; tab[used].code = code;
-        tab[used].n = 0; tab[used].steps = 0; used++;
+        tab[used].n = 0; tab[used].steps = 0; tab[used].ns = 0; tab[used].fb = 0; tab[used].fbpc = 0;
+        used++;
     }
-    if (i < used) { tab[i].n++; tab[i].steps += steps; }
+    if (i < used) {
+        tab[i].n++; tab[i].steps += steps; tab[i].ns += ns;
+        if (fallback_pc) { tab[i].fb++; tab[i].fbpc = fallback_pc; }
+    }
     total++;
     total_steps += steps;
+    total_ns += ns;
+    total_fb += fallback_pc != 0;
     const time_t now = time(NULL);
     if (!last) last = now;
     if (now - last < 3) return;
+    extern uint32_t cellGcm_flip_request_count(void);
+    fprintf(stderr, "[smc-time] %lds tid=%lu flip=%u: %u entries, %u fallbacks, %llu interpreted steps, %.3f ms:",
+            (long)(now - last), (unsigned long)GetCurrentThreadId(), cellGcm_flip_request_count(), total,
+            total_fb, (unsigned long long)total_steps, total_ns / 1e6);
+    uint8_t shown[SMC_STATS_N] = {0};
+    for (unsigned k = 0; k < SMC_TIME_TOP; k++) {
+        unsigned best = used;
+        for (unsigned j = 0; j < used; j++)
+            if (tab[j].n && !shown[j] && (best == used || tab[j].ns > tab[best].ns))
+                best = j;
+        if (best == used) break;
+        shown[best] = 1;
+        fprintf(stderr, " [img=%u ovl=%u pc=0x%05X n=%u fb=%u fbpc=0x%05X steps=%llu us=%.1f code=%016llX]",
+                tab[best].key >> 20, tab[best].ovl, tab[best].key & 0xFFFFFu, tab[best].n, tab[best].fb,
+                tab[best].fbpc, (unsigned long long)tab[best].steps, tab[best].ns / 1e3,
+                (unsigned long long)tab[best].code);
+    }
+    fputc('\n', stderr);
     fprintf(stderr, "[smc-stats] %lds: %u entries, %llu interpreted steps, %u targets, pic hits %ld rejects %ld:",
             (long)(now - last), total, (unsigned long long)total_steps, used,
             (long)s_pic_hits, (long)s_pic_rejects);
@@ -2098,8 +2179,8 @@ static void spu_smc_stats_note(int image_id, uint32_t pc, int ovl, uint32_t lr, 
     }
     fputc('\n', stderr);
     last = now;
-    used = total = 0;
-    total_steps = 0;
+    used = total = total_fb = 0;
+    total_steps = total_ns = 0;
 }
 
 static int spu_smc_microstep(spu_context* ctx)
@@ -2231,21 +2312,8 @@ static int spu_smc_microstep(spu_context* ctx)
          * corroboration gets for a decode bug. */
         if (op11 == 0x1AC || op7 == 0x08 || op7 == 0x09) { pc += 4; continue; } /* hbr/hbra/hbrr */
 
-        /* Hand off to the real interpreter rather than giving up.
-         *
-         * This microstepper knows a dozen opcodes -- enough for the
-         * runtime-generated stubs it was written for -- and spu_interp.c is a
-         * full, selftested SPU interpreter that was already sitting here
-         * unused on this path. Bailing on the first ordinary instruction is
-         * strictly worse than running it.
-         *
-         * It matters for overlay code: a SPURS job policy module DMAs its job
-         * bodies into local store and branches to them, so there is no lifted
-         * body to find and the fallback IS the execution path. Guitar Hero
-         * III`s job kernel dies here on an `ilh` at LS 0x6638 -- a perfectly
-         * ordinary instruction the interpreter handles -- and with it the
-         * decompression job it was running never completes. */
         spu_gap_note(ctx, pc, "microstep-instruction-fallback");
+        t_smc_fallback_pc = pc;
         ctx->pc = pc;
         if (!spu_interp_run_until(ctx, pc, ctx->drain_ret_pc))
             return 0;
@@ -2810,14 +2878,17 @@ void spu_indirect_branch(spu_context* ctx)
     }
     spu_pic_capture(ctx);
     if (spu_smc_stats_on()) {
-        extern uint64_t g_spu_interp_steps;
+        extern _Thread_local uint64_t g_spu_interp_steps;
         const uint32_t pc0 = ctx->pc & SPU_LS_MASK, lr0 = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
         const int img0 = ctx->image_id, ovl0 = ctx->resident_ovl;
         uint64_t code0 = 0;
         for (int k = 0; k < 8; k++) code0 = (code0 << 8) | ctx->ls[(pc0 + (uint32_t)k) & SPU_LS_MASK];
         g_spu_interp_steps = 0;
+        t_smc_fallback_pc = 0;
+        const uint64_t t0 = spu_smc_now_ns();
         const int ok = spu_smc_microstep(ctx);
-        spu_smc_stats_note(img0, pc0, ovl0, lr0, g_spu_interp_steps, code0);
+        spu_smc_stats_note(img0, pc0, ovl0, lr0, g_spu_interp_steps, code0, spu_smc_now_ns() - t0,
+                           t_smc_fallback_pc);
         if (ok) return;
     } else if (spu_smc_microstep(ctx))
         return;

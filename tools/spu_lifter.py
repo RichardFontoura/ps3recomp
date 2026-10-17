@@ -205,7 +205,11 @@ class LiftedFunction:
     body_lines: list[str] = field(default_factory=list)
     calls: list[int] = field(default_factory=list)
     succ: set = field(default_factory=set)
+    reach: set = field(default_factory=set)
+    succ_src: dict = field(default_factory=dict)
 
+
+_PIC_TERMINATORS = {"br", "bra", "bi", "iret", "stop", "stopd"}
 
 # Mnemonics whose last operand is a branch target address (0x...).
 _COND_BR = {"brz", "brnz", "brhz", "brhnz"}
@@ -511,6 +515,7 @@ class SPULifter:
         self.link_return: set = set()
         self.pc_rel_branch: dict = {}
         self.pic = False
+        self._cur_insn_addr = None
 
     def _la(self, a: int) -> str:
         return f"SPU_PIC(ctx, 0x{a:X})" if self.pic else f"0x{a:X}"
@@ -525,6 +530,7 @@ class SPULifter:
                       start: int, end: int) -> LiftedFunction:
         func = LiftedFunction(name=f"{self.prefix}spu_func_{start:08X}",
                               start_addr=start, end_addr=end)
+        self._cur_insn_addr = None
 
         internal: set[int] = set()
         for insn in insns:
@@ -537,13 +543,17 @@ class SPULifter:
             if pc_rel is not None and start <= pc_rel[1] < end:
                 internal.add(pc_rel[1])
 
+        func.reach = self._reachable(insns, start, end)
+
         last_insn = None
         for insn in insns:
             if insn.addr < start or insn.addr >= end:
                 continue
             if insn.addr in internal:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
+            self._cur_insn_addr = insn.addr
             c = self._translate(insn, func)
+            self._cur_insn_addr = None
             if c:
                 if self.trace:
                     func.body_lines.append(f"    spu_trace_pc(ctx, 0x{insn.addr:X});")
@@ -562,6 +572,7 @@ class SPULifter:
         if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
                 and end in getattr(self, "func_starts", set())):
             func.succ.add(end)
+            func.succ_src.setdefault(end, set()).add(last_insn.addr)
             func.body_lines.append(
                 f"    {{ ctx->pc = {self._la(end)}; "
                 f"g_spu_trampoline_fn = {self.prefix}spu_func_{end:08X}; return; }}")
@@ -912,7 +923,7 @@ class SPULifter:
                 return f"{link} {self._uncond_branch(addr + 4, func)}"
             if tgt is not None:
                 self.call_targets.add(tgt)
-                func.succ.add(tgt)
+                self._add_succ(func, tgt)
                 # Nested host call bracketed by host_depth (so the callee's
                 # `bi $r0` returns via host return) + SPU_DRAIN (drains the
                 # callee's own tail-chains so they don't grow the caller frame)
@@ -930,7 +941,7 @@ class SPULifter:
             if func.start_addr <= tgt < func.end_addr:
                 return f"if ({cond}) goto loc_{tgt:08X};"
             self.branch_targets.add(tgt)
-            func.succ.add(tgt)
+            self._add_succ(func, tgt)
             return (f"if ({cond}) {{ ctx->pc = {self._la(tgt)}; "
                     f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
         # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
@@ -1020,6 +1031,50 @@ class SPULifter:
         return (f'/* TODO spu: {mn} {insn.operands} */ '
                 f'spu_unsupported(0x{insn.addr:X}, "{mn}");')
 
+    def _add_succ(self, func, tgt):
+        func.succ.add(tgt)
+        func.succ_src.setdefault(tgt, set()).add(self._cur_insn_addr)
+
+    def _reachable(self, insns, start, end):
+        by_addr = {i.addr: i for i in insns if start <= i.addr < end}
+        reach, stack = set(), [start]
+        while stack:
+            a = stack.pop()
+            if a in reach or a not in by_addr:
+                continue
+            reach.add(a)
+            insn = by_addr[a]
+            tgt = self._branch_target(insn)
+            if tgt is not None and start <= tgt < end:
+                stack.append(tgt)
+            if insn.mnemonic not in _PIC_TERMINATORS:
+                stack.append(a + 4)
+        return reach
+
+    def _pic_ranges(self, f, by_start):
+        seen, stack, words = set(), [f.start_addr], set()
+        cross = self.bi_r0_jump | self.link_return
+        while stack:
+            a = stack.pop()
+            if a in seen or a not in by_start:
+                continue
+            seen.add(a)
+            g = by_start[a]
+            if g.reach & cross or not g.reach:
+                words.update(range(g.start_addr, g.end_addr, 4))
+                stack.extend(g.succ)
+                continue
+            words.update(g.reach)
+            stack.extend(t for t in g.succ
+                         if not g.succ_src.get(t) or None in g.succ_src[t] or g.succ_src[t] & g.reach)
+        ranges = []
+        for w in sorted(words):
+            if ranges and ranges[-1][1] == w:
+                ranges[-1][1] = w + 4
+            else:
+                ranges.append([w, w + 4])
+        return ranges
+
     def _pic_closure(self):
         by_start = {f.start_addr: f for f in self.functions}
         spans = {}
@@ -1039,11 +1094,21 @@ class SPULifter:
 
     def _emit_pic_table(self) -> list:
         spans = self._pic_closure()
-        out = [f"const spu_pic_entry {self.prefix}pic_functions[] = {{"]
+        by_start = {f.start_addr: f for f in self.functions}
+        out = []
+        ranges = {}
+        for f in self.functions:
+            r = self._pic_ranges(f, by_start)
+            ranges[f.start_addr] = r
+            words = ", ".join(f"0x{a:X}u, 0x{b:X}u" for a, b in r)
+            out.append(f"static const uint32_t {self.prefix}pic_ranges_{f.start_addr:08X}[] = {{ {words} }};")
+        out.append("")
+        out.append(f"const spu_pic_entry {self.prefix}pic_functions[] = {{")
         for f in self.functions:
             lo, hi = spans[f.start_addr]
-            out.append(f"    {{ 0x{f.start_addr:X}u, 0x{lo:X}u, 0x{hi:X}u, {f.name} }},")
-        out.append("    { 0, 0, 0, NULL }")
+            out.append(f"    {{ 0x{f.start_addr:X}u, 0x{lo:X}u, 0x{hi:X}u, {f.name}, "
+                       f"{self.prefix}pic_ranges_{f.start_addr:08X}, {len(ranges[f.start_addr])}u }},")
+        out.append("    { 0, 0, 0, NULL, NULL, 0 }")
         out.append("};")
         out.append(f"const unsigned {self.prefix}pic_function_count = {len(self.functions)}u;")
         out.append("")
@@ -1068,7 +1133,7 @@ class SPULifter:
         if func.start_addr <= tgt < func.end_addr:
             return f"goto loc_{tgt:08X};"
         self.branch_targets.add(tgt)
-        func.succ.add(tgt)
+        self._add_succ(func, tgt)
         return (f"{{ ctx->pc = {self._la(tgt)}; "
                 f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
 

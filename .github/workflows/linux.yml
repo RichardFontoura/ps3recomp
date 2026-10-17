@@ -377,6 +377,12 @@ jobs:
             -o /tmp/test_gcm_flip_fifo
           /tmp/test_gcm_flip_fifo
 
+      - name: SPU PIC entries match on their reachable code ranges
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra \
+            runtime/spu/tests/test_spu_pic_match.c -o /tmp/test_spu_pic_match
+          /tmp/test_spu_pic_match
+
       - name: PS3_LOG_FIRST stops counting at its limit
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra \

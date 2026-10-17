@@ -349,7 +349,7 @@ static int spu_step(spu_context* ctx) {
 }
 
 uint32_t g_spu_interp_last_pc = 0;
-uint64_t g_spu_interp_steps   = 0;
+_Thread_local uint64_t g_spu_interp_steps = 0;
 
 /* Call-trace ring buffer for diagnosing SPU asserts (env SPU_CALLTRACE). */
 #define SPU_TRACE_N 32

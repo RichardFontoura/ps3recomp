@@ -843,7 +843,7 @@ static int32_t spu_interp_fallback(uint32_t tid, uint32_t args_ea,
             tid, entry, t->img_ea, args_ea);
     int32_t sc = spu_run_interp_job(ls, entry, args_ea, -1,  /* pure interp: no fast-path rejoin */
                                     t->tid, t->group_id, 0); /* identify for mbox->event delivery */
-    { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
+    { extern uint32_t g_spu_interp_last_pc; extern _Thread_local uint64_t g_spu_interp_steps;
       fprintf(stderr, "[SPU-INTERP] tid=0x%X done (stop=0x%X, %llu insns, last pc=0x%05X)\n",
               tid, sc, (unsigned long long)g_spu_interp_steps, g_spu_interp_last_pc); }
     return sc;
@@ -922,13 +922,13 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
                                          getenv("RD_SPU_FRAME_MBOX") ? work_ea : 0u);
         { static int _sp = -1; if (_sp < 0) _sp = getenv("SPU_SPEED") ? 1 : 0;
           if (_sp) { QueryPerformanceCounter(&_t1); QueryPerformanceFrequency(&_fq);
-              extern uint64_t g_spu_interp_steps;
+              extern _Thread_local uint64_t g_spu_interp_steps;
               double sec = (double)(_t1.QuadPart - _t0.QuadPart) / (double)_fq.QuadPart;
               static int _n = 0; if (_n++ < 20)
                   fprintf(stderr, "[spu-speed] tid=0x%X %llu insns in %.3f s = %.1f M/s%c",
                           t->tid, (unsigned long long)g_spu_interp_steps, sec,
                           sec > 0 ? g_spu_interp_steps / sec / 1e6 : 0.0, 10); } }
-        { extern uint32_t g_spu_interp_last_pc; extern uint64_t g_spu_interp_steps;
+        { extern uint32_t g_spu_interp_last_pc; extern _Thread_local uint64_t g_spu_interp_steps;
           fprintf(stderr, "[SPU-FRAME] tid=0x%X done (stop=0x%X, %llu insns, last pc=0x%05X)\n",
                   t->tid, frc, (unsigned long long)g_spu_interp_steps, g_spu_interp_last_pc); }
         return 1;
