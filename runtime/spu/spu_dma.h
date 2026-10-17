@@ -17,6 +17,7 @@
 
 #include "spu_line_trace.h"
 #include "spu_context.h"
+#include "../../include/ps3emu/log_first.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -849,7 +850,7 @@ static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
         return 0;
     }
     spu->list_stall_mask &= ~(1u << t);          /* clears; re-set if it re-parks */
-    { static int _n = 0; if (_n++ < 16)
+    { static int _n = 0; if (PS3_LOG_FIRST(_n, 16))
         fprintf(stderr, "[mfc-list] RESUME img=%d tag=%u elem@0x%05X left=%u\n",
                 spu->image_id, t, spu->list_stall_elem_lsa[t],
                 spu->list_stall_remaining[t]); }

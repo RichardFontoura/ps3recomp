@@ -6,6 +6,7 @@
  * functions (not macros) means the SPU_DRAIN/SPU_RET call sites are already in
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
+#include "../../include/ps3emu/log_first.h"
 #include <setjmp.h>
 extern int g_spu_wws_pm_image;
 
@@ -85,7 +86,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     if (!s_no_ls0 && ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&
         !ctx->policy_mode && ctx->image_id > 0) {
         static int _n = 0;
-        if (_n++ < 8)
+        if (PS3_LOG_FIRST(_n, 8))
             fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
                     ctx->image_id);
         if (s_et >= 0 && ctx->image_id == s_et) {
@@ -316,7 +317,7 @@ void (*spu_take_interrupt(spu_context* ctx,
                 ctx->gpr[13]._u32[0], ctx->gpr[15]._u32[0]); } }
     ctx->pc = target & SPU_LS_MASK;
     { static int _n = 0;
-      if (_n++ < 16) {
+      if (PS3_LOG_FIRST(_n, 16)) {
           /* WWS Load->Run diagnosis: the job-manager interrupt handler advances
            * g_WwsJob_loadJobState kReadCommands(1)->kExecuteCommands(2) only if
            * (a) the ch25 stall mask has tag 0 (kLoadJob_readCommands) AND
@@ -453,7 +454,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             spu_drain_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
             if (!fn) fn = spu_lookup(pc, ctx->image_id);
             if (fn) {
-                { static int _n = 0; if (_n++ < 8)
+                { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
                             (unsigned)(return_pc & SPU_LS_MASK), pc, ctx->image_id, ctx->host_depth,
                             (int)ctx->resident_ovl); }
