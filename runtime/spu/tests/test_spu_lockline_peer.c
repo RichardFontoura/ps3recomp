@@ -60,6 +60,8 @@ uint32_t ppu_vm_size = 0;
 /* The unit under test. */
 #include "../spu_channels.c"
 
+__attribute__((weak)) uint32_t cellGcm_flip_request_count(void) { return 0; }
+
 /* ---------------------------------------------------------------------------
  * Harness
  * -----------------------------------------------------------------------*/

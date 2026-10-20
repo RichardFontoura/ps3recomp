@@ -9,6 +9,8 @@ uint32_t ppu_vm_size = 0;
 
 #include "../spu_channels.c"
 
+__attribute__((weak)) uint32_t cellGcm_flip_request_count(void) { return 0; }
+
 #define CHECK(c) do { if (c) ++g_pass; else { ++g_fail; fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); } } while (0)
 
 enum { POLLS = 1000, FLIP_AT = 900, LABEL_EA = 0x40000, LSA = 0x3000, PUT_EA = 0x50000 };

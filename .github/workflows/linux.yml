@@ -345,6 +345,7 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
             -o /tmp/test_spu_lockline_peer \
             runtime/spu/tests/test_spu_lockline_peer.c \
+            runtime/spu/spu_regcache.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
             runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
@@ -362,6 +363,7 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
             -o /tmp/test_spu_taskset_wake \
             runtime/spu/tests/test_spu_taskset_wake.c \
+            runtime/spu/spu_regcache.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
             runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
@@ -376,6 +378,7 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
             -o /tmp/test_spu_taskset_spu_create \
             runtime/spu/tests/test_spu_taskset_spu_create.c \
+            runtime/spu/spu_regcache.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
             runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
@@ -434,6 +437,7 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
             -o /tmp/test_spu_pic_dispatch \
             runtime/spu/tests/test_spu_pic_dispatch.c \
+            runtime/spu/spu_regcache.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
             runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
@@ -508,6 +512,7 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
             -o /tmp/test_spu_mfc_slots \
             runtime/spu/tests/test_spu_mfc_slots.c \
+            runtime/spu/spu_regcache.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
             runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
@@ -522,6 +527,7 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
             -o /tmp/test_spu_dma_poll \
             runtime/spu/tests/test_spu_dma_poll.c \
+            runtime/spu/spu_regcache.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
             runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \

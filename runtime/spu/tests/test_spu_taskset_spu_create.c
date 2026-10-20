@@ -11,6 +11,8 @@ uint32_t ppu_vm_size = 0;
 
 #include "../spu_channels.c"
 
+__attribute__((weak)) uint32_t cellGcm_flip_request_count(void) { return 0; }
+
 #define TASKSET_A  0x00030000u
 #define TASKSET_B  0x00032000u
 #define ELF_EA     0x00040000u

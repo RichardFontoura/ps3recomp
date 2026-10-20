@@ -49,6 +49,8 @@ uint32_t ppu_vm_size = 0;
 /* The unit under test. */
 #include "../spu_channels.c"
 
+__attribute__((weak)) uint32_t cellGcm_flip_request_count(void) { return 0; }
+
 int  spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId);
 void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_obj);
 void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId);
