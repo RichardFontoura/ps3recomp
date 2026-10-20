@@ -247,6 +247,14 @@ static struct {
 } dc;
 
 static struct {
+    int srgb;
+    int gamma;
+    int exp_tex;
+    int persp;
+    int shadow;
+} s_fpo;
+
+static struct {
     rsx_vcache* cache;
     int stats;
     u32 threads_min;
@@ -1463,6 +1471,70 @@ static u32 eng_vtex_mask(void)
  * dim. No host sampling mode is unnormalised for these, so the fragment
  * program divides the coordinates instead, and the divisor makes the sizes
  * pipeline identity (rsx_live_draw.c keys them the same way). */
+static void eng_fpo_init(void)
+{
+    s_fpo.srgb = eng_env_on("RSX_ENGINE_SRGB");
+    s_fpo.gamma = eng_env_on("RSX_ENGINE_TEX_GAMMA");
+    s_fpo.exp_tex = eng_env_on("RSX_ENGINE_EXP_TEX");
+    s_fpo.persp = eng_env_on("RSX_ENGINE_PERSP_CORR");
+    s_fpo.shadow = eng_env_on("RSX_ENGINE_SHADOW");
+}
+
+static int eng_fmt_gamma(u32 fmt)
+{
+    return (fmt >= 0x81u && fmt <= 0x88u) || fmt == 0x8Bu || fmt == 0x8Du || fmt == 0x8Eu ||
+           fmt == 0x8Fu || fmt == 0x97u || fmt == 0x9Du || fmt == 0x9Eu;
+}
+
+static int eng_fmt_bx2(u32 fmt)
+{
+    return eng_fmt_gamma(fmt) || (fmt >= 0x90u && fmt <= 0x95u) || fmt == 0x98u;
+}
+
+static void eng_fp_options(const u8* fp_uc, u32 fp_size, u32 fp_ctrl, rsx_fp_options* opt)
+{
+    memset(opt, 0, sizeof *opt);
+    opt->persp_corr = (u32)s_fpo.persp;
+    opt->position_w_is_rcp = 1u;
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(&g.rsx, &sf);
+    opt->srgb_output = (u32)(s_fpo.srgb && rsx_dsp_reg(&g.rsx, 0x1FEC) && !(fp_ctrl & 0x40u) &&
+                             sf.color_format != 0xBu && sf.color_format != 0xCu && sf.color_format != 0xDu);
+    const u32 used = rsx_fp_texture_units(fp_uc, fp_size);
+    const u32 expanded = rsx_fp_exp_tex_units(fp_uc, fp_size);
+    for (u32 u = 0; u < 16u; u++) {
+        if (!((used >> u) & 1u)) continue;
+        rsx_dsp_texture t;
+        rsx_dsp_get_texture(&g.rsx, u, &t);
+        if (!t.enabled) continue;
+        const u32 fmt = t.format & RSX_TEX_FMT_BASE_MASK;
+        if (s_fpo.gamma && eng_fmt_gamma(fmt)) opt->gamma[u] = (u8)((t.wrap >> 20) & 0xFu);
+        if (s_fpo.exp_tex && ((expanded >> u) & 1u) && eng_fmt_bx2(fmt)) {
+            u8 sel[4];
+            rsx_texture_component_remap(t.remap, t.format, sel);
+            opt->bx2[u] = (u8)((sel[1] < 4u) | ((sel[2] < 4u) << 1) | ((sel[3] < 4u) << 2) | ((sel[0] < 4u) << 3));
+        }
+        const u32 func = (t.wrap >> 28) & 0xFu;
+        if (s_fpo.shadow && fmt >= 0x90u && fmt <= 0x93u && !(t.control0 & 4u) && func >= 1u && func <= 6u) {
+            rsx_fp_shadow_desc* sd = &opt->shadow[u];
+            rsx_be_sampler_desc smp;
+            memset(&smp, 0, sizeof smp);
+            eng_decode_sampler(t.filter, t.wrap, t.control0, &smp);
+            sd->func = (u8)func;
+            sd->linear = smp.mag_linear;
+            sd->unnormalized = (u8)((t.format & RSX_TEX_FMT_UNNORM) != 0);
+            sd->scale[0] = sd->scale[1] = 1.0f;
+            if (fmt == RSX_TEX_FMT_DEPTH24_D8)
+                for (u32 i = 0; i < g.n_zdepths; i++)
+                    if (g.zdepths[i].location == t.location && g.zdepths[i].offset == t.offset) {
+                        if (g.zdepths[i].w > t.width && t.width) sd->scale[0] = (float)t.width / (float)g.zdepths[i].w;
+                        if (g.zdepths[i].h > t.height && t.height) sd->scale[1] = (float)t.height / (float)g.zdepths[i].h;
+                        break;
+                    }
+        }
+    }
+}
+
 static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][2])
 {
     u32 mask = 0;
@@ -1649,6 +1721,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][2];
     const u32 unnorm_mask = eng_unnorm_units(unnorm_dim);
 
+    rsx_fp_options fp_opts;
+    memset(&fp_opts, 0, sizeof fp_opts);
+    if (!fixed) eng_fp_options(fp_uc, fp_size, fp_ctrl, &fp_opts);
+
     memset(&g.fp_constants, 0, sizeof g.fp_constants);
     if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0) {
         eng_pipeline_fail_log("fragment constants", fp_size);
@@ -1674,6 +1750,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
         key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
         if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
+        key = eng_fnv1a(&fp_opts, sizeof fp_opts, key);
     }
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
     key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
@@ -1706,8 +1783,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
                                          layout->mask, s_vs_hlsl,
                                          sizeof s_vs_hlsl);
-        fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
-                                          s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
+        fi = rsx_fp_decompile_buffered_opts(fp_uc, fp_size, fp_ctrl, cube_mask, &fp_opts,
+                                            s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
         if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
                                                 (const u32 (*)[2])unnorm_dim, cube_mask) < 0)
@@ -3040,6 +3117,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
     rsx_dispatch_init(&g.rsx, &sink);
     g.ready = 1;
     eng_vx_init();
+    eng_fpo_init();
     /* Display buffers the title registered before the backend came up. */
     cellGcm_replay_display_buffers_to_engine();
     fprintf(stderr, "[rsx engine] register-file draw engine up (%ux%u)\n",

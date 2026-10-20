@@ -398,6 +398,108 @@ int main(void)
         check("large_program_return", backend_hlsl, "return (_o == _o) ? _o");
     }
 
+    {
+        u8 tex[16], mov8[16], mov0[16], two[32];
+        rsx_fp_options opt;
+        char base[16384];
+        u32 nconst = 0;
+        put_word(tex + 0, OPC(0x17) | OUTMASK_ALL | TEXU(0) | INSRC(4) | END);
+        put_word(tex + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(tex + 8, 0);
+        put_word(tex + 12, 0);
+        put_word(mov8 + 0, OPC(0x01) | OUTMASK_ALL | INSRC(0xC) | END);
+        put_word(mov8 + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(mov8 + 8, 0);
+        put_word(mov8 + 12, 0);
+        put_word(mov0 + 0, OPC(0x01) | OUTMASK_ALL | INSRC(4) | END);
+        put_word(mov0 + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(mov0 + 8, 0);
+        put_word(mov0 + 12, 0x80000000u);
+
+        rsx_fp_decompile(mov8, sizeof mov8, CTRL_32BIT, hlsl, sizeof hlsl);
+        check("tc8_input", hlsl, "input.tc8");
+        check("tc8_declared", hlsl, "float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;");
+        rsx_fp_decompile(mov0, sizeof mov0, CTRL_32BIT, hlsl, sizeof hlsl);
+        check_absent("tc8_only_when_read", hlsl, "TEXCOORD8");
+
+        memset(&opt, 0, sizeof opt);
+        rsx_fp_decompile_buffered_ex(tex, sizeof tex, CTRL_32BIT, 0, base, sizeof base, &nconst);
+        rsx_fp_decompile_buffered_opts(tex, sizeof tex, CTRL_32BIT, 0, &opt, hlsl, sizeof hlsl, &nconst);
+        check_true("zeroed_options_are_byte_identical", strcmp(base, hlsl) == 0);
+        rsx_fp_decompile_buffered_ex(mov0, sizeof mov0, CTRL_32BIT, 0, base, sizeof base, &nconst);
+        rsx_fp_decompile_buffered_opts(mov0, sizeof mov0, CTRL_32BIT, 0, NULL, hlsl, sizeof hlsl, &nconst);
+        check_true("null_options_are_byte_identical", strcmp(base, hlsl) == 0);
+        check_absent("persp_off_without_options", hlsl, "position.w");
+
+        opt.persp_corr = 1; opt.position_w_is_rcp = 1;
+        rsx_fp_decompile_buffered_opts(mov0, sizeof mov0, CTRL_32BIT, 0, &opt, hlsl, sizeof hlsl, &nconst);
+        check("persp_vulkan_multiplies", hlsl, "(input.tc0 * input.position.w)");
+        opt.position_w_is_rcp = 0;
+        rsx_fp_decompile_buffered_opts(mov0, sizeof mov0, CTRL_32BIT, 0, &opt, hlsl, sizeof hlsl, &nconst);
+        check("persp_d3d_divides", hlsl, "(input.tc0 / input.position.w)");
+        rsx_fp_decompile_buffered_opts(tex, sizeof tex, CTRL_32BIT, 0, &opt, hlsl, sizeof hlsl, &nconst);
+        check_absent("persp_needs_the_flag", hlsl, "position.w");
+        memset(&opt, 0, sizeof opt);
+
+        opt.gamma[0] = 0x7;
+        rsx_fp_decompile_buffered_opts(tex, sizeof tex, CTRL_32BIT, 0, &opt, hlsl, sizeof hlsl, &nconst);
+        check("gamma_wraps_fetch", hlsl, "rsx_srgb_decode(rsx_tex[0].Sample(rsx_samp[0], ");
+        check("gamma_mask", hlsl, ", 7u)");
+        check("gamma_helper", hlsl, "float4 rsx_srgb_decode(float4 s, uint m)");
+        put_word(tex + 0, OPC(0x17) | OUTMASK_ALL | TEXU(0) | INSRC(4) | END | (1u << 21));
+        rsx_fp_decompile_buffered_opts(tex, sizeof tex, CTRL_32BIT, 0, &opt, hlsl, sizeof hlsl, &nconst);
+        check_absent("exp_tex_drops_gamma", hlsl, "rsx_srgb_decode(rsx_tex");
+        check_absent("exp_tex_needs_a_mask", hlsl, "rsx_bx2(");
+        opt.bx2[0] = 0xF;
+        rsx_fp_decompile_buffered_opts(tex, sizeof tex, CTRL_32BIT, 0, &opt, hlsl, sizeof hlsl, &nconst);
+        check("exp_tex_expands", hlsl, "rsx_bx2(rsx_tex[0].Sample(rsx_samp[0], ");
+        check("exp_tex_helper", hlsl, "float4 rsx_bx2(float4 s, uint m)");
+        check_true("exp_tex_units", rsx_fp_exp_tex_units(tex, sizeof tex) == 1u &&
+                   rsx_fp_texture_units(tex, sizeof tex) == 1u &&
+                   rsx_fp_exp_tex_units(mov0, sizeof mov0) == 0u);
+        put_word(tex + 0, OPC(0x17) | OUTMASK_ALL | TEXU(0) | INSRC(4) | END);
+        memset(&opt, 0, sizeof opt);
+
+        opt.srgb_output = 1;
+        rsx_fp_decompile_buffered_opts(tex, sizeof tex, CTRL_32BIT, 0, &opt, hlsl, sizeof hlsl, &nconst);
+        check("srgb_encodes_output", hlsl, "    _o.rgb = rsx_srgb_encode(_o.rgb);\n    return (_o == _o)");
+        check("srgb_helper", hlsl, "float3 rsx_srgb_encode(float3 c)");
+        check_true("srgb_keeps_alpha_test", rsx_fp_apply_alpha_test_buffered(hlsl, sizeof hlsl, 0x201) == 1);
+        put_word(two + 0, OPC(0x01) | OUTMASK_ALL | OUTREG(0) | INSRC(1));
+        put_word(two + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(two + 8, 0);
+        put_word(two + 12, 0);
+        put_word(two + 16, OPC(0x01) | OUTMASK_ALL | OUTREG(2) | INSRC(1) | END);
+        put_word(two + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(two + 24, 0);
+        put_word(two + 28, 0);
+        rsx_fp_decompile_buffered_opts(two, sizeof two, CTRL_32BIT, 0, &opt, hlsl, sizeof hlsl, &nconst);
+        check("srgb_encodes_each_target", hlsl, "_o1.rgb = rsx_srgb_encode(_o1.rgb);");
+        memset(&opt, 0, sizeof opt);
+
+        opt.shadow[0].func = 1;
+        opt.shadow[0].scale[0] = 0.5f;
+        opt.shadow[0].scale[1] = 1.0f;
+        rsx_fp_decompile_buffered_opts(tex, sizeof tex, CTRL_32BIT, 0, &opt, hlsl, sizeof hlsl, &nconst);
+        check("shadow_call", hlsl, "_rsx_shadow0((");
+        check("shadow_point_compare", hlsl, "rsx_tex[0].SampleLevel(rsx_samp[0], uv, 0).x < c.z");
+        check("shadow_scale", hlsl, "float2 uv = c.xy * float2(0.5, 1);");
+        check_absent("shadow_replaces_sample", hlsl, "rsx_tex[0].Sample(rsx_samp[0], ");
+        opt.shadow[0].linear = 1;
+        opt.shadow[0].func = 6;
+        rsx_fp_decompile_buffered_opts(tex, sizeof tex, CTRL_32BIT, 0, &opt, hlsl, sizeof hlsl, &nconst);
+        check("shadow_linear_gathers", hlsl, "rsx_tex[0].GatherRed(rsx_samp[0], uv)");
+        check("shadow_linear_compare", hlsl, "(_d >= c.zzzz)");
+        opt.shadow[0].unnormalized = 1;
+        put_word(tex + 0, OPC(0x18) | OUTMASK_ALL | TEXU(0) | INSRC(4) | END);
+        rsx_fp_decompile_buffered_opts(tex, sizeof tex, CTRL_32BIT, 0, &opt, hlsl, sizeof hlsl, &nconst);
+        check("shadow_projective", hlsl, "_rsx_shadow0(float3(");
+        check("shadow_unnormalized", hlsl, "float2 uv = c.xy / float2(_w, _h);");
+        opt.shadow[0].func = 7;
+        rsx_fp_decompile_buffered_opts(tex, sizeof tex, CTRL_32BIT, 0, &opt, hlsl, sizeof hlsl, &nconst);
+        check_absent("shadow_always_is_a_plain_fetch", hlsl, "_rsx_shadow0");
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

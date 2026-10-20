@@ -123,6 +123,29 @@ int rsx_fp_decompile_buffered_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     char* out, u32 out_size, u32* out_constant_count);
 
+typedef struct rsx_fp_shadow_desc {
+    u8 func;
+    u8 linear;
+    u8 unnormalized;
+    u8 reserved;
+    float scale[2];
+} rsx_fp_shadow_desc;
+
+typedef struct rsx_fp_options {
+    u32 srgb_output;
+    u32 persp_corr;
+    u32 position_w_is_rcp;
+    u8 gamma[16];
+    u8 bx2[16];
+    rsx_fp_shadow_desc shadow[16];
+} rsx_fp_options;
+
+int rsx_fp_decompile_buffered_opts(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, const rsx_fp_options* opt,
+    char* out, u32 out_size, u32* out_constant_count);
+u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes);
+u32 rsx_fp_exp_tex_units(const u8* ucode, u32 max_bytes);
+
 /* Extract the exact runtime inline-CONST payload. Returns the slot count on
  * success or -1 for an unterminated/truncated/oversized program. */
 int rsx_fp_collect_constants(
