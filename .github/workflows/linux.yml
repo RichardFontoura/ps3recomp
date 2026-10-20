@@ -452,6 +452,18 @@ jobs:
             runtime/platform/win32_compat.c runtime/trace/ps3_timeline.c \
             -lpthread -lm
           /tmp/test_spu_pic_dispatch
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spu_pm_stub \
+            runtime/spu/tests/test_spu_pm_stub.c \
+            runtime/spu/spu_regcache.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c runtime/trace/ps3_timeline.c \
+            -lpthread -lm
+          /tmp/test_spu_pm_stub
           python3 tools/test_spu_pic_lift.py
 
       - name: cellAudio port opens in a page-aligned guest arena

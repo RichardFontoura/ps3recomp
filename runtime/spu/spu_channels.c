@@ -46,6 +46,11 @@ void spurs_kernel_temp_area_refresh(spu_context* ctx);
 static int s_spu_ibf = -1;
 static _Thread_local uint32_t t_smc_fallback_pc;
 
+#define SPU_PM_STUB_LSA   0x3FEC0u
+#define SPU_PM_STUB_REGS  76u
+#define SPU_PM_STUB_BI79  0x35002780u
+static int s_spu_pm_stub = -1;
+
 static uint64_t spu_host_ns(void)
 {
 #ifdef _WIN32
@@ -1955,6 +1960,7 @@ static spu_pic_slot s_pic[SPU_PIC_MAX_ENTRIES];
 static unsigned s_pic_count;
 static volatile long s_pic_hits, s_pic_rejects;
 static SRWLOCK s_pic_capture_lock = SRWLOCK_INIT;
+static int spu_pic_rejoin_probe(const spu_context* ctx, uint32_t pc);
 
 typedef struct {
     int image;
@@ -2016,6 +2022,8 @@ void spu_pic_register(const spu_pic_entry* entries, unsigned count,
         s_pic_count++;
     }
     qsort(s_pic, s_pic_count, sizeof s_pic[0], spu_pic_slot_cmp);
+    const char* rejoin = getenv("SPU_PIC_REJOIN");
+    g_spu_interp_rejoin_probe = (s_pic_count && !(rejoin && rejoin[0] == '0')) ? spu_pic_rejoin_probe : NULL;
 }
 
 static void spu_pic_reject_trace(const spu_context* ctx, const spu_pic_entry* e, const uint8_t* code,
@@ -2058,13 +2066,13 @@ static void spu_pic_reject_trace(const spu_context* ctx, const spu_pic_entry* e,
     fputc('\n', stderr);
 }
 
-static spu_fn spu_pic_lookup(spu_context* ctx)
+static const spu_pic_entry* spu_pic_find(const spu_context* ctx, uint32_t pc)
 {
     static int off = -1, hull = -1;
     if (off < 0) off = getenv("SPU_PIC_OFF") != NULL;
     if (hull < 0) hull = getenv("SPU_PIC_HULL") != NULL;
     if (!s_pic_count || off) return NULL;
-    const uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
+    pc &= SPU_LS_MASK & ~3u;
     if (pc + 16u > SPU_LS_SIZE) return NULL;
     const uint64_t key = spu_pic_key(ctx->ls + pc);
     unsigned lo = 0, hi = s_pic_count;
@@ -2082,11 +2090,24 @@ static spu_fn spu_pic_lookup(spu_context* ctx)
             spu_pic_reject_trace(ctx, e, s_pic[i].code, pc - before);
             continue;
         }
-        __atomic_add_fetch(&s_pic_hits, 1, __ATOMIC_RELAXED);
-        ctx->pic_base = (pc - e->addr) & SPU_LS_MASK;
-        return spu_rc_select((spu_fn)e->func);
+        return e;
     }
     return NULL;
+}
+
+static spu_fn spu_pic_lookup(spu_context* ctx)
+{
+    const uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
+    const spu_pic_entry* e = spu_pic_find(ctx, pc);
+    if (!e) return NULL;
+    __atomic_add_fetch(&s_pic_hits, 1, __ATOMIC_RELAXED);
+    ctx->pic_base = (pc - e->addr) & SPU_LS_MASK;
+    return spu_rc_select((spu_fn)e->func);
+}
+
+static int spu_pic_rejoin_probe(const spu_context* ctx, uint32_t pc)
+{
+    return spu_pic_find(ctx, pc) != NULL;
 }
 
 static void spu_pic_capture(const spu_context* ctx)
@@ -2202,9 +2223,45 @@ static void spu_smc_stats_note(int image_id, uint32_t pc, int ovl, uint32_t lr, 
     total_steps = total_ns = 0;
 }
 
+static uint32_t spu_pm_stub_word(int save, uint32_t r)
+{
+    return (save ? 0x20FF0000u : 0x30FF0000u) | ((0x38u + 2u * r) << 8) | r;
+}
+
+static int spu_pm_stub_kind(const spu_context* ctx)
+{
+    const uint8_t* p = ctx->ls + SPU_PM_STUB_LSA;
+    const uint32_t w0 = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+    const int save = w0 == spu_pm_stub_word(1, 0);
+    if (!save && w0 != spu_pm_stub_word(0, 0)) return -1;
+    for (uint32_t r = 1; r <= SPU_PM_STUB_REGS; r++) {
+        const uint8_t* q = p + 4u * r;
+        const uint32_t w = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+        if (w != (r < SPU_PM_STUB_REGS ? spu_pm_stub_word(save, r) : SPU_PM_STUB_BI79)) return -1;
+    }
+    return save;
+}
+
+static int spu_pm_stub_run(spu_context* ctx)
+{
+    if (s_spu_pm_stub < 0) { const char* e = getenv("SPU_PM_STUB"); s_spu_pm_stub = !(e && e[0] == '0'); }
+    if (!s_spu_pm_stub) return 0;
+    const int save = spu_pm_stub_kind(ctx);
+    if (save < 0) return 0;
+    for (uint32_t r = 0; r < SPU_PM_STUB_REGS; r++) {
+        const uint32_t a = ((spu_pm_stub_word(save, r) >> 7) & 0xFFFFu) << 2 & SPU_LS_MASK & ~15u;
+        if (save) spu_ls_write128(ctx, a, ctx->gpr[r]);
+        else      ctx->gpr[r] = spu_ls_read128(ctx, a);
+    }
+    ctx->pc = ctx->gpr[79]._u32[0] & SPU_LS_MASK & ~3u;
+    g_spu_trampoline_fn = spu_indirect_branch;
+    return 1;
+}
+
 static int spu_smc_microstep(spu_context* ctx)
 {
     uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
+    if (pc == SPU_PM_STUB_LSA && spu_pm_stub_run(ctx)) return 1;
     for (int steps = 0; steps < 4096; steps++) {
         uint32_t w = ((uint32_t)ctx->ls[pc] << 24) | ((uint32_t)ctx->ls[pc+1] << 16) |
                      ((uint32_t)ctx->ls[pc+2] << 8) | ctx->ls[pc+3];

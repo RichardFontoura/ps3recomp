@@ -13,7 +13,7 @@ __attribute__((weak)) uint32_t cellGcm_flip_request_count(void) { return 0; }
 
 #define CHECK(c) do { if (c) ++g_pass; else { ++g_fail; fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); } } while (0)
 
-enum { REGION = 0x80, ENTRY = 0x20, LOADED_AT = 0x12340 };
+enum { REGION = 0x80, ENTRY = 0x20, LOADED_AT = 0x12340, INTERP_AT = 0x1000 };
 
 static int g_pass, g_fail;
 static spu_context g_ctx;
@@ -79,6 +79,25 @@ int main(void)
     g_ctx.pc = 0x3FF80 + ENTRY;
     CHECK(spu_pic_lookup(&g_ctx) == fragment_entry);
     CHECK(SPU_PIC(&g_ctx, 0x100) == ((0x3FF80u + 0x100u) & SPU_LS_MASK));
+
+    spu_context_init(&g_ctx, 0);
+    memcpy(g_ctx.ls + LOADED_AT, g_region, REGION);
+    const uint32_t br = (0x064u << 23) | ((((LOADED_AT + ENTRY - INTERP_AT) >> 2) & 0xFFFFu) << 7);
+    g_ctx.ls[INTERP_AT] = (uint8_t)(br >> 24);
+    g_ctx.ls[INTERP_AT + 1] = (uint8_t)(br >> 16);
+    g_ctx.ls[INTERP_AT + 2] = (uint8_t)(br >> 8);
+    g_ctx.ls[INTERP_AT + 3] = (uint8_t)br;
+    CHECK(g_spu_interp_rejoin_probe != NULL);
+    CHECK(spu_interp_run(&g_ctx, INTERP_AT) == LOADED_AT + ENTRY);
+    CHECK(g_ctx.pc == LOADED_AT + ENTRY);
+    CHECK(spu_pic_lookup(&g_ctx) == fragment_entry);
+
+    setenv("SPU_PIC_REJOIN", "0", 1);
+    spu_pic_register(g_entries, 0, g_region, REGION, 0);
+    CHECK(g_spu_interp_rejoin_probe == NULL);
+    unsetenv("SPU_PIC_REJOIN");
+    spu_pic_register(g_entries, 0, g_region, REGION, 0);
+    CHECK(g_spu_interp_rejoin_probe != NULL);
 
     printf("SPU PIC dispatch: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

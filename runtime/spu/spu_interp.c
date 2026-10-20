@@ -350,6 +350,7 @@ static int spu_step(spu_context* ctx) {
 
 uint32_t g_spu_interp_last_pc = 0;
 _Thread_local uint64_t g_spu_interp_steps = 0;
+int (*g_spu_interp_rejoin_probe)(const spu_context* ctx, uint32_t pc);
 
 /* Call-trace ring buffer for diagnosing SPU asserts (env SPU_CALLTRACE). */
 #define SPU_TRACE_N 32
@@ -409,7 +410,8 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         }
         if (ctx->image_id >= 0 &&
             ((stop_lsa && ctx->pc == stop_lsa) ||
-             (ctx->pc != sequential_pc && spu_lifted_lookup(ctx, ctx->pc)))) {
+             (ctx->pc != sequential_pc &&
+              (spu_lifted_lookup(ctx, ctx->pc) || (g_spu_interp_rejoin_probe && g_spu_interp_rejoin_probe(ctx, ctx->pc)))))) {
             g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc;
         }
         sequential_pc = ctx->pc + 4;
