@@ -40,6 +40,7 @@ extern "C" {
 
 extern int g_spu_wws_pm_image;
 extern int g_spu_wws_job_image;
+void spurs_kernel_temp_area_refresh(spu_context* ctx);
 static _Thread_local uint32_t t_smc_fallback_pc;
 
 static uint64_t spu_host_ns(void)
@@ -2373,6 +2374,7 @@ void spu_indirect_branch(spu_context* ctx)
             if (trace && (n <= 4 || (n % 4096) == 0))
                 fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
                         n, ctx->gpr[3]._u32[0]);
+            spurs_kernel_temp_area_refresh(ctx);
             ctx->gpr[3] = spu_make_preferred_u32(0);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;

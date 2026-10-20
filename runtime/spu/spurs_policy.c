@@ -25,11 +25,13 @@
 #include "spu_context.h"
 #include "spu_workload.h"
 #include "spurs_pm_args.h"
+#include "spu_coherency.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
+extern uint8_t* vm_base;
 void spu_mfc_release(spu_context* ctx);
 
 /* Counters the intercepts in spu_channels.c maintain for the CURRENT run
@@ -37,6 +39,23 @@ void spu_mfc_release(spu_context* ctx);
 _Thread_local volatile unsigned g_spurs_pm_polls = 0;
 _Thread_local volatile unsigned g_spurs_pm_exited = 0;
 volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
+
+void spurs_kernel_temp_area_refresh(spu_context* ctx)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* e = getenv("SPURS_TEMPAREA");
+        enabled = !e || atoi(e) != 0;
+    }
+    if (!enabled || !vm_base) return;
+    const uint8_t* k = ctx->ls + 0x1C4;
+    const uint32_t ea = ((uint32_t)k[0] << 24) | ((uint32_t)k[1] << 16)
+                      | ((uint32_t)k[2] << 8) | k[3];
+    if (!ea || ea > 0xFFFFFF80u) return;
+    spu_lockline_lock();
+    memcpy(ctx->ls + 0x100, vm_base + ea, 0x80);
+    spu_lockline_unlock();
+}
 
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,
@@ -147,6 +166,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     KBE32(0x1E0, SPURS_PM_EXIT_TO_KERNEL_LS);
     KBE32(0x1E4, SPURS_PM_SELECT_WORKLOAD_LS);
 #undef KBE32
+    spurs_kernel_temp_area_refresh(ctx);
 
     /* Entry registers per cellSpursModuleEntry. */
     ctx->gpr[0]._u32[0] = SPURS_PM_EXIT_TO_KERNEL_LS;  /* return-to-kernel link */
@@ -512,9 +532,8 @@ int spurs_run_taskset_policy_probe(uint32_t taskset_ea, uint32_t taskid,
     KBE32(0x1D8, wid);                  KBE32(0x1DC, wid);
     KBE32(0x1E0, SPURS_PM_EXIT_TO_KERNEL_LS);
     KBE32(0x1E4, SPURS_PM_SELECT_WORKLOAD_LS);
-    /* taskset EA also planted at the SpursKernelContext taskset slot the policy
-     * reads for its taskset DMA (mirrors the cri-r4 injection at LS 0x27B8). */
 #undef KBE32
+    spurs_kernel_temp_area_refresh(ctx);
 
     ctx->gpr[0]._u32[0] = SPURS_PM_EXIT_TO_KERNEL_LS;
     ctx->gpr[1]._u32[0] = 0x3FFB0;
