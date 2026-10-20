@@ -1951,6 +1951,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
  * branch, 0 on an unknown opcode (caller falls through to BRANCH-TO-0). */
 #define SPU_PIC_MAX_ENTRIES 65536u
 #define SPU_PIC_MAX_SPAN    0x8000u
+#define SPU_PIC_FRAGMENT_IMAGE 1
 
 typedef struct {
     uint64_t key;
@@ -2012,7 +2013,10 @@ static int spu_pic_slot_cmp(const void* x, const void* y)
 void spu_pic_register(const spu_pic_entry* entries, unsigned count,
                       const uint8_t* code, uint32_t code_size, int image_id)
 {
-    (void)image_id;
+    if (image_id == SPU_PIC_FRAGMENT_IMAGE) {
+        const char* e = getenv("SPU_PIC_FRAGMENTS");
+        if (e && e[0] == '0') return;
+    }
     for (unsigned i = 0; i < count && s_pic_count < SPU_PIC_MAX_ENTRIES; i++) {
         const spu_pic_entry* e = &entries[i];
         if (!e->func || e->addr + 16u > code_size || e->hi > code_size || e->lo > e->addr ||

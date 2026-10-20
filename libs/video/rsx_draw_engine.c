@@ -252,6 +252,7 @@ static struct {
     int exp_tex;
     int persp;
     int shadow;
+    int tc89;
 } s_fpo;
 
 static int s_vx_ab_cache_off;
@@ -1481,6 +1482,7 @@ static void eng_fpo_init(void)
     s_fpo.exp_tex = eng_env_on("RSX_ENGINE_EXP_TEX");
     s_fpo.persp = eng_env_on("RSX_ENGINE_PERSP_CORR");
     s_fpo.shadow = eng_env_on("RSX_ENGINE_SHADOW");
+    s_fpo.tc89 = eng_env_on("RSX_ENGINE_TC89");
 }
 
 static int eng_fmt_gamma(u32 fmt)
@@ -1499,6 +1501,7 @@ static void eng_fp_options(const u8* fp_uc, u32 fp_size, u32 fp_ctrl, rsx_fp_opt
     memset(opt, 0, sizeof *opt);
     opt->persp_corr = (u32)s_fpo.persp;
     opt->position_w_is_rcp = 1u;
+    opt->no_tc89 = (u32)!s_fpo.tc89;
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
     opt->srgb_output = (u32)(s_fpo.srgb && rsx_dsp_reg(&g.rsx, 0x1FEC) && !(fp_ctrl & 0x40u) &&

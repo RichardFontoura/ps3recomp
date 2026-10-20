@@ -586,6 +586,7 @@ static int rsx_fp_decompile_internal(
         u32 input_src = (w0 & FP_INPUT_SRC_MASK) >> FP_INPUT_SRC_SHIFT;
         u32 tex_unit  = (w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT;
         int is_branch = (w2 & FP_BRANCH) ? 1 : 0;
+        if (opt && opt->no_tc89 && (input_src == 0xC || input_src == 0xD)) input_src = 0xE;
 
         /* Execution condition (exec_if) + condition-code write (set_cond).
          * Faithful to RPCS3 FragmentProgramDecompiler {GetRawCond, AddCodeCond,

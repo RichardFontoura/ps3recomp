@@ -92,6 +92,14 @@ int main(void)
     CHECK(g_ctx.pc == LOADED_AT + ENTRY);
     CHECK(spu_pic_lookup(&g_ctx) == fragment_entry);
 
+    const unsigned before = s_pic_count;
+    setenv("SPU_PIC_FRAGMENTS", "0", 1);
+    spu_pic_register(g_entries, 1, g_region, REGION, SPU_PIC_FRAGMENT_IMAGE);
+    CHECK(s_pic_count == before);
+    unsetenv("SPU_PIC_FRAGMENTS");
+    spu_pic_register(g_entries, 1, g_region, REGION, SPU_PIC_FRAGMENT_IMAGE);
+    CHECK(s_pic_count == before + 1);
+
     setenv("SPU_PIC_REJOIN", "0", 1);
     spu_pic_register(g_entries, 0, g_region, REGION, 0);
     CHECK(g_spu_interp_rejoin_probe == NULL);

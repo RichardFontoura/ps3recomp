@@ -135,6 +135,7 @@ typedef struct rsx_fp_options {
     u32 srgb_output;
     u32 persp_corr;
     u32 position_w_is_rcp;
+    u32 no_tc89;
     u8 gamma[16];
     u8 bx2[16];
     rsx_fp_shadow_desc shadow[16];

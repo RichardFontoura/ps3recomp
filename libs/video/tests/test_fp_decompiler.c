@@ -423,6 +423,10 @@ int main(void)
         check_absent("tc8_only_when_read", hlsl, "TEXCOORD8");
 
         memset(&opt, 0, sizeof opt);
+        opt.no_tc89 = 1;
+        rsx_fp_decompile_buffered_opts(mov8, sizeof mov8, CTRL_32BIT, 0, &opt, hlsl, sizeof hlsl, &nconst);
+        check_absent("tc89_switch_off", hlsl, "tc8");
+        opt.no_tc89 = 0;
         rsx_fp_decompile_buffered_ex(tex, sizeof tex, CTRL_32BIT, 0, base, sizeof base, &nconst);
         rsx_fp_decompile_buffered_opts(tex, sizeof tex, CTRL_32BIT, 0, &opt, hlsl, sizeof hlsl, &nconst);
         check_true("zeroed_options_are_byte_identical", strcmp(base, hlsl) == 0);
