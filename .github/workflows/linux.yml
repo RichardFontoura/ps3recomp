@@ -108,6 +108,14 @@ jobs:
             -std=gnu17 -I include -I runtime/spu \
             -o /tmp/test_spu_xfloat runtime/spu/tests/test_spu_xfloat.c -lm
           /tmp/test_spu_xfloat
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+            -std=gnu17 -O2 -I include -I runtime/spu \
+            -o /tmp/test_spu_fast_fp runtime/spu/tests/test_spu_fast_fp.c -lm
+          /tmp/test_spu_fast_fp
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+            -std=gnu17 -O2 -march=x86-64-v3 -I include -I runtime/spu \
+            -o /tmp/test_spu_fast_fp_v3 runtime/spu/tests/test_spu_fast_fp.c -lm
+          /tmp/test_spu_fast_fp_v3
 
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.

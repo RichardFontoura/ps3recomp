@@ -260,6 +260,15 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * executes at a time. No-op when unarmed. The thread-local halt env above
      * makes a token pause/resume mid-run safe. */
     yz_lockstep_register(ctx);
+#if SPU_FAST_FP_SUPPORTED
+    static int s_fast_fp = -1;
+    if (s_fast_fp < 0) {
+        const char* e = getenv("SPU_FAST_FP");
+        s_fast_fp = !(e && e[0] == '0');
+    }
+    const unsigned csr_saved = _mm_getcsr();
+    if (s_fast_fp) _mm_setcsr(csr_saved | SPU_MXCSR_SPU_BITS);
+#endif
     switch (setjmp(s_spu_halt_env)) {
     case 1:
         halted = 1;
@@ -289,6 +298,9 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
               fflush(stderr); } }
         SPU_DRAIN(ctx);
     }
+#if SPU_FAST_FP_SUPPORTED
+    _mm_setcsr(csr_saved);
+#endif
     yz_lockstep_unregister(ctx);   /* leave the ring; hand the token onward */
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
