@@ -116,6 +116,14 @@ jobs:
             -std=gnu17 -O2 -march=x86-64-v3 -I include -I runtime/spu \
             -o /tmp/test_spu_fast_fp_v3 runtime/spu/tests/test_spu_fast_fp.c -lm
           /tmp/test_spu_fast_fp_v3
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+            -std=gnu17 -O2 -msse4.1 -DSPU_LS_NO_PROBES -I include -I runtime/spu \
+            -o /tmp/test_spu_helpers_vec runtime/spu/tests/test_spu_helpers_vec.c -lm
+          /tmp/test_spu_helpers_vec
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+            -std=gnu17 -O2 -march=x86-64-v3 -DSPU_LS_NO_PROBES -I include -I runtime/spu \
+            -o /tmp/test_spu_helpers_vec_v3 runtime/spu/tests/test_spu_helpers_vec.c -lm
+          /tmp/test_spu_helpers_vec_v3
 
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
@@ -464,6 +472,7 @@ jobs:
             runtime/spu/spurs_job.c runtime/spu/spu_tsp_weak.c \
             runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c \
             runtime/spu/spu_interp.c runtime/spu/spu_lifted_thread.c \
+            runtime/spu/spu_regcache.c \
             runtime/syscalls/spu_fallback.c runtime/syscalls/sdk_version_weak.c \
             runtime/platform/win32_compat.c runtime/trace/ps3_timeline.c \
             -lpthread -lm

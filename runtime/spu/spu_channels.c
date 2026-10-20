@@ -14,6 +14,7 @@
 
 #include "spu_dma.h"
 #include "spu_pic_match.h"
+#include "spu_regcache.h"
 #include "../../include/ps3emu/log_first.h"
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
@@ -221,6 +222,7 @@ void spu_stop(spu_context* ctx)
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 {
     int halted = 0;
+    entry = spu_rc_select(entry);
     /* Job-args probe: image-1 (the WWS job binary) entries arrive at the crt
      * with r3/r4 zeroed in SOME runs while the jm2 runner sets them -- count
      * and stamp every image-1 run here to find the argless caller. */
@@ -1453,7 +1455,7 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
             /* One compare on the return path; the report itself is rare. */
             if (e->image_id != image_id)
                 spu_report_cross_image(addr, image_id, e->image_id);
-            return e->fn;
+            return spu_rc_select(e->fn);
         }
     }
     return NULL;
@@ -1546,7 +1548,7 @@ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
     if (!ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
     for (unsigned i = 0; i < s_stack_reset_count; ++i)
         if (ctx->pc == s_stack_reset[i].entry &&
-            fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
+            spu_rc_select(fn) == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
             g_spu_trampoline_fn = 0;
             longjmp(s_spu_halt_env, 2);
         }
@@ -2078,7 +2080,7 @@ static spu_fn spu_pic_lookup(spu_context* ctx)
         }
         __atomic_add_fetch(&s_pic_hits, 1, __ATOMIC_RELAXED);
         ctx->pic_base = (pc - e->addr) & SPU_LS_MASK;
-        return (spu_fn)e->func;
+        return spu_rc_select((spu_fn)e->func);
     }
     return NULL;
 }
