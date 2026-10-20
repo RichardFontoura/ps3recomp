@@ -78,6 +78,8 @@ static uint8_t*  g_guest_mem;
 uint8_t*         vm_base;
 uint32_t         ppu_vm_size = GUEST_SIZE;
 
+__attribute__((weak)) uint32_t cellGcm_flip_request_count(void) { return 0; }
+
 /* Darwin raises SIGBUS for an inaccessible mapping where Linux raises SIGSEGV
  * (runtime/platform/tests/test_guest_ptr_trap.c is where that was measured), so
  * both mean the same thing here. Naming the failure is the whole job; there is
