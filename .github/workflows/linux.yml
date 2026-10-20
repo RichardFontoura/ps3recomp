@@ -396,6 +396,12 @@ jobs:
             -o /tmp/test_gcm_flip_fifo
           /tmp/test_gcm_flip_fifo
 
+      - name: Inline PPU guest memory access
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -I runtime/ppu \
+            runtime/ppu/tests/test_ppu_mem_inline.c -o /tmp/test_ppu_mem_inline
+          /tmp/test_ppu_mem_inline
+
       - name: SPU PIC entries match on their reachable code ranges
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra \

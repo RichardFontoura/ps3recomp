@@ -87,6 +87,9 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
  * one missed event on the very first reservation of the run. */
 static int s_coh_armed;
 
+const unsigned char* const g_spu_coh_bitmap_ro = s_coh_bitmap;
+const int* const g_spu_coh_armed_ro = &s_coh_armed;
+
 #define SPU_COH_MAX_CTX 256
 static spu_context* s_coh_ctxs[SPU_COH_MAX_CTX];
 static int          s_coh_n;

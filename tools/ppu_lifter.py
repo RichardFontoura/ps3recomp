@@ -130,6 +130,7 @@ int      ppu_stdcx64(uint64_t addr, uint64_t expected, uint64_t val);
 #ifdef __cplusplus
 }
 #endif
+#include "ppu_mem_inline.h"
 
 /* Syscall handler */
 #ifdef __cplusplus
