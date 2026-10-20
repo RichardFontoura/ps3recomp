@@ -396,6 +396,12 @@ jobs:
             -o /tmp/test_gcm_flip_fifo
           /tmp/test_gcm_flip_fifo
 
+      - name: Mod folders laid over USRDIR (PS3_MODS)
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -I include -I runtime -I libs \
+            runtime/syscalls/tests/test_vfs_mods.c -o /tmp/test_vfs_mods
+          /tmp/test_vfs_mods
+
       - name: Inline PPU guest memory access
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -I runtime/ppu \

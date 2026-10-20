@@ -264,12 +264,16 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
 
     s32 v = 0;
     switch (id) {
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG:
-        v = CELL_SYSUTIL_LANG_ENGLISH_US;
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:
-        v = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
-        break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG: {
+        const char* e = getenv("PS3_SYS_LANG");
+        v = (e && *e >= '0' && *e <= '9') ? atoi(e) : CELL_SYSUTIL_LANG_ENGLISH_US;
+        if (v > CELL_SYSUTIL_LANG_TURKISH) v = CELL_SYSUTIL_LANG_ENGLISH_US;
+        break; }
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN: {
+        const char* e = getenv("PS3_ENTER_BUTTON");
+        v = (e && (e[0] == 'c' || e[0] == 'C') && (e[1] == 'i' || e[1] == 'I'))
+            ? CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CIRCLE : CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
+        break; }
     case CELL_SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT:    v = 0; break; /* YYYYMMDD */
     case CELL_SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT:    v = 0; break; /* 24-hour */
     case CELL_SYSUTIL_SYSTEMPARAM_ID_TIMEZONE:       v = 0; break; /* UTC */

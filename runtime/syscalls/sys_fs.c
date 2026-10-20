@@ -30,6 +30,8 @@
 sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];
 sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
 char            g_sys_fs_root[512] = ".";
+static char     s_vfs_mods[2048];
+static int      s_vfs_mods_read;
 
 static void write_be32(uint32_t addr, uint32_t val)
 {
@@ -89,9 +91,43 @@ static void fs_normalize_sep(char* p) {
  *
  * All three path translators call this -- sys_fs, cellFs and ppu_fs each do
  * their own translation (see docs), and a guest path can arrive at any of them. */
+static void ps3_vfs_mod_overlay(char* path, size_t cap)
+{
+    if (!s_vfs_mods_read) {
+        const char* e = getenv("PS3_MODS");
+        if (e) snprintf(s_vfs_mods, sizeof s_vfs_mods, "%s", e);
+        s_vfs_mods_read = 1;
+    }
+    if (!s_vfs_mods[0]) return;
+    const char* u = strstr(path, "/USRDIR/");
+    if (!u) u = strstr(path, "\\USRDIR\\");
+    if (!u) return;
+    const char* rel = u + 8;
+    struct stat st;
+    for (const char* m = s_vfs_mods; *m; ) {
+        const char* end = strchr(m, ';');
+        const size_t n = end ? (size_t)(end - m) : strlen(m);
+        char alt[1024];
+        if (n && n + 1 + strlen(rel) < sizeof alt) {
+            memcpy(alt, m, n);
+            snprintf(alt + n, sizeof alt - n, "/%s", rel);
+            fs_normalize_sep(alt);
+            if (stat(alt, &st) == 0 && S_ISREG(st.st_mode)) {
+                static int s_logged;
+                if (s_logged++ < 32) printf("[mods] %s -> %s\n", rel, alt);
+                snprintf(path, cap, "%s", alt);
+                return;
+            }
+        }
+        if (!end) break;
+        m = end + 1;
+    }
+}
+
 void ps3_vfs_ps3game_fallback(char* path, size_t cap)
 {
     struct stat st;
+    if (path && *path) ps3_vfs_mod_overlay(path, cap);
     if (!path || !*path || stat(path, &st) == 0)
         return;
     char* p = strstr(path, "/PS3_GAME/");
