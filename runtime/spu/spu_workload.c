@@ -1197,14 +1197,21 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      * keeps the block-forever behaviour. Reversible, opt-in. */
     unsigned drain = 0; { const char* e = getenv("LBP_WS_DRAIN"); if (e) { drain = (unsigned)atoi(e); if (!drain) drain = 1; } }
     int drained = 0;
-    /* Release the global SPU-serial lock while parked so another SPU task can
-     * run (and possibly signal us); re-acquired before returning to resume. */
+    static int poll_ms = -1;
+    if (poll_ms < 0) {
+        const char* e = getenv("SPU_WAITSIG_POLL_MS");
+        poll_ms = e ? atoi(e) : 2;
+        if (poll_ms <= 0 || poll_ms > 1000) poll_ms = 1000;
+    }
+    unsigned waited_ms = 0;
     spu_serial_release();
     ps3_timeline(PS3_TL_SIGNAL_WAIT_BEGIN, taskId);
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);
     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
-        if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
+        if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, (DWORD)poll_ms, 0)) {
+            if ((waited_ms += (unsigned)poll_ms) < 1000) continue;
+            waited_ms = 0;
             static int _n = 0;
             if (++secs && _n < 16) { _n++;
                 fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
@@ -1217,8 +1224,12 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
 #else
     pthread_mutex_lock(&s_sig_lock);
     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
-        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1;
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += (long)poll_ms * 1000000L;
+        while (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ts.tv_sec++; }
         if (pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0) {
+            if ((waited_ms += (unsigned)poll_ms) < 1000) continue;
+            waited_ms = 0;
             static int _n = 0;
             if (++secs && _n < 16) { _n++;
                 fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
