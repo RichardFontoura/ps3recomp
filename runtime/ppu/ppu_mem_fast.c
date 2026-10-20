@@ -15,6 +15,7 @@ void vm_write32(uint64_t addr, uint32_t val);
 void vm_write64(uint64_t addr, uint64_t val);
 
 uint32_t g_ppu_mem_fast_hi = 0;
+static uint32_t s_ppu_mem_fast_configured;
 
 static const char* const k_diagnostics[] = {
     "PPU_FORCE_READ_ADDR", "PPU_HOTMAP", "PPU_RVAL", "PPU_RVAL64", "PPU_RWATCH", "PPU_SPINBT",
@@ -33,6 +34,7 @@ void ppu_mem_fast_init(void)
         if (ppu_vm_size && ppu_vm_size < hi) hi = ppu_vm_size;
         g_ppu_mem_fast_hi = hi;
     }
+    s_ppu_mem_fast_configured = g_ppu_mem_fast_hi;
     fprintf(stderr, "[PPU] inline guest memory access: %s%s%s\n", why ? "off (" : "on",
             why ? why : "", why ? ")" : "");
 }
@@ -45,3 +47,8 @@ PPU_MEM_SLOW_CC void ppu_mem_slow_write8(uint64_t a, uint8_t v) { vm_write8(a, v
 PPU_MEM_SLOW_CC void ppu_mem_slow_write16(uint64_t a, uint16_t v) { vm_write16(a, v); }
 PPU_MEM_SLOW_CC void ppu_mem_slow_write32(uint64_t a, uint32_t v) { vm_write32(a, v); }
 PPU_MEM_SLOW_CC void ppu_mem_slow_write64(uint64_t a, uint64_t v) { vm_write64(a, v); }
+
+void ppu_mem_fast_set_enabled(int on)
+{
+    __atomic_store_n(&g_ppu_mem_fast_hi, on ? s_ppu_mem_fast_configured : 0u, __ATOMIC_RELAXED);
+}

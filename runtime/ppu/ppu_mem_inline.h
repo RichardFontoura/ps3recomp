@@ -25,6 +25,7 @@ extern const unsigned char* const g_spu_coh_bitmap_ro;
 extern const int* const g_spu_coh_armed_ro;
 
 void ppu_mem_fast_init(void);
+void ppu_mem_fast_set_enabled(int on);
 PPU_MEM_SLOW_CC uint8_t ppu_mem_slow_read8(uint64_t a);
 PPU_MEM_SLOW_CC uint16_t ppu_mem_slow_read16(uint64_t a);
 PPU_MEM_SLOW_CC uint32_t ppu_mem_slow_read32(uint64_t a);

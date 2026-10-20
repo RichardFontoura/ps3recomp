@@ -28,6 +28,8 @@ typedef void (*spu_lifted_fn)(spu_context*);
  * overrides this so computed branches reach compiled code. */
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa);
 extern int (*g_spu_interp_rejoin_probe)(const spu_context* ctx, uint32_t pc);
+void spu_pic_rejoin_set_enabled(int on);
+void spu_pm_stub_set_enabled(int on);
 
 /* Interpret from `start_lsa` until the SPU stops (`stop`/`stopd`/halt) or a
  * host-fatal decode. Handles all control flow internally. Returns the stop

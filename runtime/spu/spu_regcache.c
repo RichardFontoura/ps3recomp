@@ -13,6 +13,7 @@ static const void** s_hash;
 static uintptr_t s_mask;
 static int s_active;
 static atomic_int s_state;
+static atomic_int s_ab_off;
 
 static uintptr_t spu_rc_slot(const void* fn)
 {
@@ -87,7 +88,7 @@ int spu_rc_active(void)
     return s_active;
 }
 
-spu_rc_fn spu_rc_select(spu_rc_fn fn)
+spu_rc_fn spu_rc_canonical(spu_rc_fn fn)
 {
     if (!fn) return fn;
     if (atomic_load_explicit(&s_state, memory_order_acquire) != RC_READY) spu_rc_init();
@@ -100,4 +101,15 @@ spu_rc_fn spu_rc_select(spu_rc_fn fn)
         if (k == key) return (spu_rc_fn)s_hash[2u * j + 1u];
         j = (j + 1u) & s_mask;
     }
+}
+
+spu_rc_fn spu_rc_select(spu_rc_fn fn)
+{
+    if (atomic_load_explicit(&s_ab_off, memory_order_relaxed)) return fn;
+    return spu_rc_canonical(fn);
+}
+
+void spu_rc_set_enabled(int on)
+{
+    atomic_store_explicit(&s_ab_off, !on, memory_order_relaxed);
 }

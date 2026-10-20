@@ -50,6 +50,8 @@ static _Thread_local uint32_t t_smc_fallback_pc;
 #define SPU_PM_STUB_REGS  76u
 #define SPU_PM_STUB_BI79  0x35002780u
 static int s_spu_pm_stub = -1;
+static int s_spu_ab_pm_stub_off;
+static int s_spu_ab_pic_rejoin_off;
 
 static uint64_t spu_host_ns(void)
 {
@@ -1557,7 +1559,7 @@ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
     if (!ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
     for (unsigned i = 0; i < s_stack_reset_count; ++i)
         if (ctx->pc == s_stack_reset[i].entry &&
-            spu_rc_select(fn) == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
+            spu_rc_canonical(fn) == spu_rc_canonical(spu_lookup(ctx->pc, s_stack_reset[i].image_id))) {
             g_spu_trampoline_fn = 0;
             longjmp(s_spu_halt_env, 2);
         }
@@ -2107,7 +2109,18 @@ static spu_fn spu_pic_lookup(spu_context* ctx)
 
 static int spu_pic_rejoin_probe(const spu_context* ctx, uint32_t pc)
 {
+    if (__atomic_load_n(&s_spu_ab_pic_rejoin_off, __ATOMIC_RELAXED)) return 0;
     return spu_pic_find(ctx, pc) != NULL;
+}
+
+void spu_pic_rejoin_set_enabled(int on)
+{
+    __atomic_store_n(&s_spu_ab_pic_rejoin_off, !on, __ATOMIC_RELAXED);
+}
+
+void spu_pm_stub_set_enabled(int on)
+{
+    __atomic_store_n(&s_spu_ab_pm_stub_off, !on, __ATOMIC_RELAXED);
 }
 
 static void spu_pic_capture(const spu_context* ctx)
@@ -2245,7 +2258,7 @@ static int spu_pm_stub_kind(const spu_context* ctx)
 static int spu_pm_stub_run(spu_context* ctx)
 {
     if (s_spu_pm_stub < 0) { const char* e = getenv("SPU_PM_STUB"); s_spu_pm_stub = !(e && e[0] == '0'); }
-    if (!s_spu_pm_stub) return 0;
+    if (!s_spu_pm_stub || __atomic_load_n(&s_spu_ab_pm_stub_off, __ATOMIC_RELAXED)) return 0;
     const int save = spu_pm_stub_kind(ctx);
     if (save < 0) return 0;
     for (uint32_t r = 0; r < SPU_PM_STUB_REGS; r++) {

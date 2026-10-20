@@ -254,6 +254,9 @@ static struct {
     int shadow;
 } s_fpo;
 
+static int s_vx_ab_cache_off;
+static int s_vx_ab_threads_off;
+
 static struct {
     rsx_vcache* cache;
     int stats;
@@ -2083,7 +2086,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 
     u64 hash = 0;
     int store = 0;
-    if (vx.cache && !dc.inl && eng_vx_blob(allow_remap, &ia, ia_loc, restart_en, restart_val, base_index)) {
+    if (vx.cache && !dc.inl && !__atomic_load_n(&s_vx_ab_cache_off, __ATOMIC_RELAXED) && eng_vx_blob(allow_remap, &ia, ia_loc, restart_en, restart_val, base_index)) {
         hash = rsx_vcache_hash(vx.blob, vx.words);
         rsx_vcache_output hit;
         if (rsx_vcache_lookup(vx.cache, vx.blob, vx.words, hash, eng_guest_ptr, NULL, &hit) &&
@@ -2154,6 +2157,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         return;
     }
     const int ok = (vx.threads_min && dc.n_refs >= vx.threads_min && rsx_vertex_workers_count() &&
+                    !__atomic_load_n(&s_vx_ab_threads_off, __ATOMIC_RELAXED) &&
                     eng_plan_all_stable(&dc.fetch_plan))
         ? rsx_vertex_fetch_parallel(&dc.fetch_plan, dc.refs, dc.n_refs, dc.verts, layout->stride, ENG_VW_CHUNK)
         : rsx_vertex_fetch_range(&dc.fetch_plan, dc.refs, 0, dc.n_refs, dc.verts, layout->stride);
@@ -3205,6 +3209,16 @@ void rsx_draw_engine_present_buffer(u32 buffer_id)
 void rsx_draw_engine_note_flip(u32 buffer_id)
 {
     g.last_flip_buffer = buffer_id & 7u;
+}
+
+void rsx_draw_engine_set_vertex_cache_enabled(int on)
+{
+    __atomic_store_n(&s_vx_ab_cache_off, !on, __ATOMIC_RELAXED);
+}
+
+void rsx_draw_engine_set_vertex_threads_enabled(int on)
+{
+    __atomic_store_n(&s_vx_ab_threads_off, !on, __ATOMIC_RELAXED);
 }
 
 void rsx_draw_engine_vertex_cache_stats(rsx_vcache_stats* out)

@@ -307,6 +307,8 @@ int  rsx_draw_engine_blit(u32 src_location, u32 src_offset, u32 src_pitch,
 u32  rsx_draw_engine_guest_draws(void);
 
 struct rsx_vcache_stats;
+void rsx_draw_engine_set_vertex_cache_enabled(int on);
+void rsx_draw_engine_set_vertex_threads_enabled(int on);
 void rsx_draw_engine_vertex_cache_stats(struct rsx_vcache_stats* out);
 
 u64  rsx_draw_engine_decompile_ns(u32* count);

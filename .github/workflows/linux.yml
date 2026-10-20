@@ -398,6 +398,12 @@ jobs:
             -o /tmp/test_gcm_flip_fifo
           /tmp/test_gcm_flip_fifo
 
+      - name: In-run A/B phases (PS3_AB)
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I runtime/spu -I runtime/platform \
+            tests/ab/test_ps3_ab.c runtime/trace/ps3_ab.c runtime/spu/spu_regcache.c -pthread -lm -o /tmp/test_ps3_ab
+          /tmp/test_ps3_ab
+
       - name: Mod folders laid over USRDIR (PS3_MODS)
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -I include -I runtime -I libs \
