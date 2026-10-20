@@ -14,6 +14,7 @@
  */
 #include "rsx_draw_engine.h"
 #include "rsx_primitives.h"   /* RSX_PRIMITIVE_* */
+#include "rsx_vertex_cache.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -223,11 +224,24 @@ static void stub_scissor(void* u, u32 x, u32 y, u32 w, u32 h)
 
 static void stub_stencil_ref(void* u, u32 r) { (void)u; stub.stencil_ref = r; }
 
+static u64 g_draw_hash;
+
+static u64 fnv64(u64 h, const void* data, u64 bytes)
+{
+    const u8* p = (const u8*)data;
+    for (u64 i = 0; i < bytes; i++) h = (h ^ p[i]) * 0x100000001B3ull;
+    return h;
+}
+
 static void stub_draw(void* u, rsx_topology topology, const void* verts,
                       u32 count, u32 stride, const u32* indices,
                       u32 index_count)
 {
-    (void)u; (void)indices;
+    (void)u;
+    g_draw_hash = fnv64(0xCBF29CE484222325ull, &count, sizeof count);
+    g_draw_hash = fnv64(g_draw_hash, &index_count, sizeof index_count);
+    if (verts) g_draw_hash = fnv64(g_draw_hash, verts, (u64)count * stride);
+    if (indices) g_draw_hash = fnv64(g_draw_hash, indices, (u64)index_count * 4u);
     stub.n_draw++;
     memset(stub.draw_first_vertex, 0, sizeof stub.draw_first_vertex);
     if (verts && stride >= sizeof stub.draw_first_vertex)
@@ -1453,6 +1467,129 @@ static void test_targets_read_on_the_gpu(void)
     g_stub_backend.surface_blit = NULL;
 }
 
+#define VC_VTX_OFFSET 0x00200000u
+#define VC_IDX_OFFSET 0x00300000u
+#define VC_VERTS      3000u
+#define VC_INDICES    1500u
+#define VC_RESTART    97u
+
+static void vc_put16(u8* p, u32 v) { p[0] = (u8)(v >> 8); p[1] = (u8)v; }
+
+static void vc_fill(void)
+{
+    u64 rng = 0x2545F4914F6CDD1Dull;
+    for (u32 i = 0; i < VC_VERTS * 4u; i++) {
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        const float f = (float)(rng % 2001u) / 1000.0f - 1.0f;
+        u32 w;
+        memcpy(&w, &f, 4);
+        u8* p = vm_base + VC_VTX_OFFSET + i * 4u;
+        p[0] = (u8)(w >> 24); p[1] = (u8)(w >> 16); p[2] = (u8)(w >> 8); p[3] = (u8)w;
+    }
+    for (u32 i = 0; i < VC_INDICES; i++) {
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        vc_put16(vm_base + VC_IDX_OFFSET + i * 2u, (i % VC_RESTART == VC_RESTART - 1u)
+                 ? 0xFFFFu : (u32)(rng % (VC_VERTS - 10u)));
+    }
+}
+
+static u32 vc_index(u32 i)
+{
+    const u8* p = vm_base + VC_IDX_OFFSET + i * 2u;
+    return ((u32)p[0] << 8) | p[1];
+}
+
+static void vc_mutate_vertex(void) { vm_base[VC_VTX_OFFSET + vc_index(5) * 16u + 6u] ^= 0x5Au; }
+static void vc_mutate_index(void) { vc_put16(vm_base + VC_IDX_OFFSET + 7u * 2u, (vc_index(7) + 1u) % (VC_VERTS - 10u)); }
+static void vc_mutate_unused(void) { vm_base[VC_VTX_OFFSET + (VC_VERTS - 1u) * 16u] ^= 0x33u; }
+
+static void vc_engine_up(const char* cache, const char* threads)
+{
+    setenv("RSX_ENGINE_VERTEX_CACHE", cache, 1);
+    setenv("RSX_ENGINE_VERTEX_THREADS", threads, 1);
+    setenv("RSX_ENGINE_VERTEX_THREADS_MIN", "1", 1);
+    engine_up();
+}
+
+static u64 vc_draw(u32 prim)
+{
+    m(0x181C, VC_IDX_OFFSET);
+    m(0x1820, 1u | (1u << 4));
+    m(0x1DAC, 1u);
+    m(0x1DB0, 0xFFFFu);
+    m(M_VTXBUF_OFFSET, 0x80000000u | VC_VTX_OFFSET);
+    m(M_BEGIN_END, prim);
+    for (u32 first = 0; first < VC_INDICES; first += 256u) {
+        const u32 n = VC_INDICES - first < 256u ? VC_INDICES - first : 256u;
+        m(0x1824, first | ((n - 1u) << 24));
+    }
+    m(M_BEGIN_END, 0u);
+    return g_draw_hash;
+}
+
+static u64 vc_reference(u32 prim)
+{
+    vc_engine_up("0", "0");
+    const u64 h = vc_draw(prim);
+    engine_down();
+    return h;
+}
+
+static void test_vertex_cache_prim(u32 prim, const char* name)
+{
+    vc_fill();
+    const u64 base = vc_reference(prim);
+    vc_mutate_vertex();
+    const u64 after_vertex = vc_reference(prim);
+    vc_mutate_index();
+    const u64 after_index = vc_reference(prim);
+    CHECK(base != after_vertex && after_vertex != after_index,
+          "%s: the mutations change the draw", name);
+
+    vc_fill();
+    vc_engine_up("0", "4");
+    CHECK(vc_draw(prim) == base, "%s: worker threads give the serial bytes", name);
+    engine_down();
+
+    vc_engine_up("1", "4");
+    int same = 1;
+    for (int i = 0; i < 4; i++) same &= vc_draw(prim) == base;
+    rsx_vcache_stats st;
+    rsx_draw_engine_vertex_cache_stats(&st);
+    CHECK(same, "%s: repeated cached draws give the uncached bytes", name);
+    CHECK(st.stores == 1 && st.hits == 2,
+          "%s: stored on the second sighting, hit after (stores %llu, hits %llu)", name,
+          (unsigned long long)st.stores, (unsigned long long)st.hits);
+    vc_mutate_unused();
+    CHECK(vc_draw(prim) == base, "%s: a byte outside the drawn span still hits", name);
+    rsx_draw_engine_vertex_cache_stats(&st);
+    CHECK(st.hits == 3, "%s: that draw was a hit (%llu)", name, (unsigned long long)st.hits);
+    vc_mutate_unused();
+    vc_mutate_vertex();
+    CHECK(vc_draw(prim) == after_vertex, "%s: a vertex rewritten in place is seen", name);
+    CHECK(vc_draw(prim) == after_vertex, "%s: and cached again", name);
+    vc_mutate_index();
+    CHECK(vc_draw(prim) == after_index, "%s: an index rewritten in place is seen", name);
+    for (int i = 0; i < 3; i++) same &= vc_draw(prim) == after_index;
+    CHECK(same, "%s: later draws keep the new bytes", name);
+    rsx_draw_engine_vertex_cache_stats(&st);
+    CHECK(st.misses_changed >= 2, "%s: the rewrites were changed-content misses (%llu)", name,
+          (unsigned long long)st.misses_changed);
+    engine_down();
+}
+
+static void test_vertex_cache(void)
+{
+    printf("-- vertex cache and worker threads\n");
+    test_vertex_cache_prim(RSX_PRIMITIVE_TRIANGLE_STRIP, "strip");
+    test_vertex_cache_prim(RSX_PRIMITIVE_TRIANGLES, "list");
+    test_vertex_cache_prim(RSX_PRIMITIVE_QUADS, "quads");
+    test_vertex_cache_prim(RSX_PRIMITIVE_LINES, "lines");
+    unsetenv("RSX_ENGINE_VERTEX_CACHE");
+    unsetenv("RSX_ENGINE_VERTEX_THREADS");
+    unsetenv("RSX_ENGINE_VERTEX_THREADS_MIN");
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -1487,6 +1624,7 @@ int main(void)
     test_depth_read_as_color();
     test_color_read_as_float();
     test_targets_read_on_the_gpu();
+    test_vertex_cache();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

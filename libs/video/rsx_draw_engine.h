@@ -306,6 +306,9 @@ int  rsx_draw_engine_blit(u32 src_location, u32 src_offset, u32 src_pitch,
  * through the built-in pair is not one of them. */
 u32  rsx_draw_engine_guest_draws(void);
 
+struct rsx_vcache_stats;
+void rsx_draw_engine_vertex_cache_stats(struct rsx_vcache_stats* out);
+
 u64  rsx_draw_engine_decompile_ns(u32* count);
 
 /* The centre pixel of the surface the last flip presented, as A8R8G8B8 --

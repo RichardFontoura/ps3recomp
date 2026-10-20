@@ -15,13 +15,18 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_primitives.h"
 #include "rsx_restart_cuts.h"
+#include "rsx_vertex_cache.h"
 #include "rsx_vertex_formats.h"
+#include "rsx_vertex_workers.h"
 #include "rsx_vp_decompiler.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
@@ -44,6 +49,12 @@ extern u32 ppu_vm_size;
 #define ENG_MAX_VTEXTURES  64
 #define ENG_MAX_PIPELINES  RSX_DRAW_ENGINE_MAX_PIPELINES
 #define ENG_MAX_BATCHES    256
+#define ENG_VC_BLOB_WORDS  (32u + 4u * ENG_MAX_BATCHES + 16u * RSX_DSP_NUM_VERTEX_ATTR)
+#define ENG_VC_REGIONS     (ENG_MAX_BATCHES + RSX_DSP_NUM_VERTEX_ATTR)
+#define ENG_VC_DEFAULT_MB  256u
+#define ENG_VC_REPORT_EVERY 600u
+#define ENG_VW_DEFAULT_MIN 4096u
+#define ENG_VW_CHUNK       1024u
 #define ENG_VERT_STRIDE    (RSX_DSP_NUM_VERTEX_ATTR * 16u)
 #define ENG_INVALID        0xFFFFFFFFu
 /* Guest textures larger than this are a misdecoded register, not an image;
@@ -229,7 +240,25 @@ static struct {
      * FIFO rather than from a vertex array. */
     const u8* inl;
     u32 inl_bytes;
+
+    const u8* vsrc;
+    const u32* csrc;
+    const u32* rsrc;
 } dc;
+
+static struct {
+    rsx_vcache* cache;
+    int stats;
+    u32 threads_min;
+    u32 last_report;
+    u32 words;
+    u32 n_regions;
+    u8* stage;
+    u64 stage_used;
+    u64 stage_cap;
+    u32 blob[ENG_VC_BLOB_WORDS];
+    rsx_vcache_region regions[ENG_VC_REGIONS];
+} vx;
 
 static void eng_texture_reclaim(u64 want);
 static void eng_textures_touch(u32 location, u32 offset, u32 bytes);
@@ -1752,6 +1781,9 @@ static void dc_reset(void)
     dc.refs_remapped = 0;
     dc.fetch_ok = 1;
     dc.inl = NULL;
+    dc.vsrc = NULL;
+    dc.csrc = NULL;
+    dc.rsrc = NULL;
     dc.inl_bytes = 0;
 }
 
@@ -1795,58 +1827,241 @@ static int dc_reserve_indices(u32 count)
     return 1;
 }
 
-/* Turn this group's batches into a reference list, recording a CUT rather
- * than fetching a phantom vertex wherever the restart sentinel appears, then
- * collapse repeated references and fetch each unique vertex once.
- * rsx_live_draw.c's fetch_batches_hoisted (4165-4292). */
+static u64 eng_env_u64(const char* name, u64 fallback)
+{
+    const char* e = getenv(name);
+    return (e && *e >= '0' && *e <= '9') ? strtoull(e, NULL, 10) : fallback;
+}
+
+static u32 eng_vertex_threads_default(void)
+{
+#if !defined(_WIN32)
+    const long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    return cpus >= 16 ? 2u : 0u;
+#else
+    return 0u;
+#endif
+}
+
+static void eng_vx_init(void)
+{
+    if (eng_env_on("RSX_ENGINE_VERTEX_CACHE"))
+        vx.cache = rsx_vcache_create(eng_env_u64("RSX_ENGINE_VERTEX_CACHE_MB", ENG_VC_DEFAULT_MB) << 20);
+    vx.stats = getenv("RSX_ENGINE_VERTEX_CACHE_STATS") != NULL;
+    vx.threads_min = (u32)eng_env_u64("RSX_ENGINE_VERTEX_THREADS_MIN", ENG_VW_DEFAULT_MIN);
+    const u32 threads = rsx_vertex_workers_start(
+        (u32)eng_env_u64("RSX_ENGINE_VERTEX_THREADS", eng_vertex_threads_default()));
+    fprintf(stderr, "[rsx engine] vertex cache %s (RSX_ENGINE_VERTEX_CACHE=0 turns it off), "
+            "%u vertex worker thread(s) for draws of %u+ vertices (RSX_ENGINE_VERTEX_THREADS)\n",
+            vx.cache ? "on" : "off", threads, vx.threads_min);
+}
+
+static void eng_vx_shutdown(void)
+{
+    rsx_vertex_workers_stop();
+    rsx_vcache_destroy(vx.cache);
+    free(vx.stage);
+    memset(&vx, 0, sizeof vx);
+}
+
+static void eng_vx_report(void)
+{
+    if (!vx.stats || !vx.cache || g.frames - vx.last_report < ENG_VC_REPORT_EVERY) return;
+    vx.last_report = g.frames;
+    rsx_vcache_stats st;
+    rsx_vcache_get_stats(vx.cache, &st);
+    fprintf(stderr, "[rsx vcache] frame %u: lookups %llu hits %llu new %llu changed %llu stores %llu "
+            "skipped %llu evictions %llu, %llu entries, %llu MB, %llu MB compared, %llu MB stored\n",
+            g.frames, (unsigned long long)st.lookups, (unsigned long long)st.hits,
+            (unsigned long long)st.misses_new, (unsigned long long)st.misses_changed,
+            (unsigned long long)st.stores, (unsigned long long)st.skipped,
+            (unsigned long long)st.evictions, (unsigned long long)st.entries,
+            (unsigned long long)(st.bytes_used >> 20), (unsigned long long)(st.bytes_compared >> 20),
+            (unsigned long long)(st.bytes_stored >> 20));
+}
+
+static void eng_vx_put(u32 w)
+{
+    if (vx.words < ENG_VC_BLOB_WORDS) vx.blob[vx.words] = w;
+    vx.words++;
+}
+
+static void eng_vx_put_float(float f)
+{
+    u32 w;
+    memcpy(&w, &f, 4);
+    eng_vx_put(w);
+}
+
+static int eng_vx_blob(int allow_remap, const rsx_dsp_index_array* ia, u32 ia_loc, int restart_en,
+                       u32 restart_val, u32 base_index)
+{
+    const rsx_vertex_fetch_plan* plan = &dc.fetch_plan;
+    vx.words = 0;
+    eng_vx_put((u32)allow_remap);
+    eng_vx_put(dc.n_arr);
+    for (u32 b = 0; b < dc.n_arr; b++) { eng_vx_put(dc.arr[b].first); eng_vx_put(dc.arr[b].count); }
+    eng_vx_put(dc.n_idx);
+    for (u32 b = 0; b < dc.n_idx; b++) { eng_vx_put(dc.idx[b].first); eng_vx_put(dc.idx[b].count); }
+    if (dc.n_idx) {
+        eng_vx_put(ia->offset);
+        eng_vx_put(ia_loc);
+        eng_vx_put((u32)ia->is_u32);
+        eng_vx_put((u32)restart_en);
+        eng_vx_put(restart_val);
+        eng_vx_put(base_index);
+    }
+    eng_vx_put(plan->layout.mask);
+    eng_vx_put(plan->layout.stride);
+    eng_vx_put(plan->layout.count);
+    eng_vx_put(plan->base_offset);
+    eng_vx_put(plan->divider_mask);
+    for (u32 slot = 0; slot < plan->layout.count; slot++) {
+        const u32 attr = plan->layout.attrs[slot];
+        const rsx_vertex_fetch_attr* f = &plan->attr[attr];
+        eng_vx_put(attr);
+        eng_vx_put(f->desc.type);
+        eng_vx_put(f->desc.size);
+        eng_vx_put(f->desc.stride);
+        eng_vx_put(f->desc.frequency);
+        eng_vx_put(f->desc.offset);
+        eng_vx_put(f->desc.location);
+        eng_vx_put(f->elem_size);
+        eng_vx_put(f->stride);
+        for (u32 k = 0; k < 4; k++) eng_vx_put_float(f->default_value[k]);
+    }
+    return vx.words <= ENG_VC_BLOB_WORDS;
+}
+
+static int eng_vx_stage(const u8* src, u32 location, u32 offset, u32 bytes, u64* raw_off)
+{
+    if (vx.n_regions >= ENG_VC_REGIONS) return 0;
+    const u64 need = vx.stage_used + bytes;
+    if (need > vx.stage_cap) {
+        u64 next = vx.stage_cap ? vx.stage_cap : (1u << 20);
+        while (next < need) next *= 2u;
+        u8* p = (u8*)realloc(vx.stage, (size_t)next);
+        if (!p) return 0;
+        vx.stage = p;
+        vx.stage_cap = next;
+    }
+    memcpy(vx.stage + vx.stage_used, src, bytes);
+    rsx_vcache_region* r = &vx.regions[vx.n_regions++];
+    r->location = location;
+    r->offset = offset;
+    r->bytes = bytes;
+    r->raw_off = vx.stage_used;
+    *raw_off = vx.stage_used;
+    vx.stage_used = need;
+    return 1;
+}
+
+static int eng_vx_stage_attrs(void)
+{
+    rsx_vertex_fetch_plan* plan = &dc.fetch_plan;
+    u64 offs[RSX_DSP_NUM_VERTEX_ATTR];
+    for (u32 slot = 0; slot < plan->layout.count; slot++) {
+        const u32 attr = plan->layout.attrs[slot];
+        const rsx_vertex_fetch_attr* f = &plan->attr[attr];
+        offs[slot] = UINT64_MAX;
+        if (!f->desc.type || !f->desc.size) continue;
+        if (!f->stable_base) return 0;
+        const u64 prefix = (u64)plan->base_offset + (u64)f->desc.offset;
+        const u64 start = prefix + (u64)f->stable_first * f->stride;
+        const u64 end = prefix + (u64)f->stable_last * f->stride + f->elem_size;
+        if (!eng_vx_stage(f->stable_base, f->desc.location, (u32)start, (u32)(end - start), &offs[slot]))
+            return 0;
+    }
+    for (u32 slot = 0; slot < plan->layout.count; slot++)
+        if (offs[slot] != UINT64_MAX) plan->attr[plan->layout.attrs[slot]].stable_base = vx.stage + offs[slot];
+    return 1;
+}
+
+static int eng_plan_all_stable(const rsx_vertex_fetch_plan* plan)
+{
+    for (u32 slot = 0; slot < plan->layout.count; slot++) {
+        const rsx_vertex_fetch_attr* f = &plan->attr[plan->layout.attrs[slot]];
+        if (f->desc.type && f->desc.size && !f->stable_base) return 0;
+    }
+    return 1;
+}
+
 static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 {
+    rsx_dsp_index_array ia;
+    memset(&ia, 0, sizeof ia);
+    u32 base_index = 0, esz = 2u, restart_val = 0, ia_loc = RSX_LOCATION_LOCAL;
+    int restart_en = 0;
+    if (dc.n_idx) {
+        base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
+        rsx_dsp_get_index_array(&g.rsx, &ia);
+        esz = ia.is_u32 ? 4u : 2u;
+        restart_en = rsx_dsp_restart_index_enabled(&g.rsx, ia.is_u32);
+        restart_val = rsx_dsp_restart_index(&g.rsx);
+        ia_loc = ia.location ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
+    }
+    dc.layout = *layout;
+    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+    rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
+
+    u64 hash = 0;
+    int store = 0;
+    if (vx.cache && !dc.inl && eng_vx_blob(allow_remap, &ia, ia_loc, restart_en, restart_val, base_index)) {
+        hash = rsx_vcache_hash(vx.blob, vx.words);
+        rsx_vcache_output hit;
+        if (rsx_vcache_lookup(vx.cache, vx.blob, vx.words, hash, eng_guest_ptr, NULL, &hit) &&
+            hit.stride == layout->stride) {
+            dc.n_source_refs = hit.n_source_refs;
+            dc.n_refs = dc.n_verts = hit.n_verts;
+            dc.refs_remapped = hit.refs_remapped;
+            dc.n_cuts = hit.n_cuts;
+            dc.vsrc = hit.verts;
+            dc.csrc = hit.cuts;
+            dc.rsrc = hit.remap;
+            eng_vx_report();
+            return;
+        }
+        store = rsx_vcache_want_store(vx.cache, hash);
+    }
+    vx.stage_used = 0;
+    vx.n_regions = 0;
+
     for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)
         for (u32 i = 0; i < dc.arr[b].count && dc.fetch_ok; i++)
             if (!dc_push_ref(dc.arr[b].first + i, 0)) dc.fetch_ok = 0;
 
-    if (dc.n_idx && dc.fetch_ok) {
-        const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
-        rsx_dsp_index_array ia;
-        rsx_dsp_get_index_array(&g.rsx, &ia);
-        const u32 esz = ia.is_u32 ? 4u : 2u;
-        const int restart_en = rsx_dsp_restart_index_enabled(&g.rsx, ia.is_u32);
-        const u32 restart_val = rsx_dsp_restart_index(&g.rsx);
-        /* The index array's location field is a DMA selector, not the
-         * rsx_dsp location enum: 0 selects local memory. */
-        const u32 ia_loc = ia.location ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
-
-        for (u32 b = 0; b < dc.n_idx && dc.fetch_ok; b++) {
-            const u32 first = dc.idx[b].first, count = dc.idx[b].count;
-            const u64 start = (u64)ia.offset + (u64)first * esz;
-            const u64 bytes = (u64)count * esz;
-            const u8* run = NULL;
-            if (count && start <= 0xFFFFFFFFull && bytes <= 0xFFFFFFFFull &&
-                start + bytes <= 0x100000000ull)
-                run = eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes);
-            for (u32 i = 0; i < count && dc.fetch_ok; i++) {
-                const u8* p = run ? run + (size_t)i * esz
-                    : eng_guest_ptr(NULL, ia_loc, ia.offset + (first + i) * esz, esz);
-                if (!p) { dc.fetch_ok = 0; break; }
-                const u32 index = ia.is_u32
-                    ? (((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3])
-                    : (u32)((p[0] << 8) | p[1]);
-                if (restart_en && index == restart_val) {
-                    if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts,
-                                              dc.n_refs))
-                        dc.fetch_ok = 0;
-                    continue;
-                }
-                if (!dc_push_ref(index, base_index)) dc.fetch_ok = 0;
+    for (u32 b = 0; b < dc.n_idx && dc.fetch_ok; b++) {
+        const u32 first = dc.idx[b].first, count = dc.idx[b].count;
+        const u64 start = (u64)ia.offset + (u64)first * esz;
+        const u64 bytes = (u64)count * esz;
+        const u8* run = NULL;
+        if (count && start <= 0xFFFFFFFFull && bytes <= 0xFFFFFFFFull &&
+            start + bytes <= 0x100000000ull)
+            run = eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes);
+        if (store) {
+            u64 off;
+            if (run && eng_vx_stage(run, ia_loc, (u32)start, (u32)bytes, &off)) run = vx.stage + off;
+            else store = 0;
+        }
+        for (u32 i = 0; i < count && dc.fetch_ok; i++) {
+            const u8* p = run ? run + (size_t)i * esz
+                : eng_guest_ptr(NULL, ia_loc, ia.offset + (first + i) * esz, esz);
+            if (!p) { dc.fetch_ok = 0; break; }
+            const u32 index = ia.is_u32
+                ? (((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3])
+                : (u32)((p[0] << 8) | p[1]);
+            if (restart_en && index == restart_val) {
+                if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts,
+                                          dc.n_refs))
+                    dc.fetch_ok = 0;
+                continue;
             }
+            if (!dc_push_ref(index, base_index)) dc.fetch_ok = 0;
         }
     }
     if (!dc.fetch_ok) return;
 
     dc.n_source_refs = dc.n_refs;
-    /* Only a topology this engine rebuilds through an index buffer may share
-     * repeated references. A line strip or a point list is drawn in the order
-     * it arrived, so collapsing duplicates would reorder it. */
     if (allow_remap && dc.n_refs > 1) {
         u32 unique = dc.n_refs;
         if (rsx_vertex_remap_build(&dc.ref_remap, dc.refs, dc.n_refs, &unique)) {
@@ -1855,22 +2070,31 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         }
     }
 
-    dc.layout = *layout;
-    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
-    rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
     rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
+    if (store && !eng_vx_stage_attrs()) store = 0;
     if (!dc_reserve_verts((u64)dc.n_refs * layout->stride)) {
         dc.fetch_ok = 0;
         return;
     }
-    for (u32 i = 0; i < dc.n_refs; i++) {
-        u8* dst = layout->stride ? dc.verts + (u64)i * layout->stride : NULL;
-        if (!rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i], dst)) {
-            dc.fetch_ok = 0;
-            return;
-        }
+    const int ok = (vx.threads_min && dc.n_refs >= vx.threads_min && rsx_vertex_workers_count() &&
+                    eng_plan_all_stable(&dc.fetch_plan))
+        ? rsx_vertex_fetch_parallel(&dc.fetch_plan, dc.refs, dc.n_refs, dc.verts, layout->stride, ENG_VW_CHUNK)
+        : rsx_vertex_fetch_range(&dc.fetch_plan, dc.refs, 0, dc.n_refs, dc.verts, layout->stride);
+    if (!ok) {
+        dc.fetch_ok = 0;
+        return;
     }
     dc.n_verts = dc.n_refs;
+    dc.vsrc = dc.verts;
+    dc.csrc = dc.cuts;
+    dc.rsrc = dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL;
+    if (store) {
+        const rsx_vcache_output out = { dc.verts, dc.n_verts, layout->stride, dc.cuts, dc.n_cuts,
+                                        dc.rsrc, dc.n_source_refs, dc.refs_remapped };
+        rsx_vcache_store(vx.cache, vx.blob, vx.words, hash, vx.regions, vx.n_regions, vx.stage,
+                         vx.stage_used, &out);
+    }
+    eng_vx_report();
 }
 
 /* ---- sink ---------------------------------------------------------------- */
@@ -2361,7 +2585,7 @@ static void pd_note_vertices(const rsx_vertex_layout_plan* layout, u32 n_draw,
                 a0.location, a0.offset, a0.stride, ia.location, ia.offset);
     }
     for (u32 v = 0; v < dc.n_verts && v < 4; v++) {
-        const float* p = (const float*)(dc.verts + (size_t)v * layout->stride);
+        const float* p = (const float*)(dc.vsrc + (size_t)v * layout->stride);
         fprintf(f, "    v%u", v);
         for (u32 s = 0; s < layout->count; s++)
             fprintf(f, " a%u(%g %g %g %g)", layout->attrs[s], p[s * 4], p[s * 4 + 1],
@@ -2484,7 +2708,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
         if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) return;
         n_draw = indexed
             ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
-                                                   dc.cuts, dc.n_cuts)
+                                                   dc.csrc, dc.n_cuts)
             : dc.n_source_refs - dc.n_source_refs % 3u;
     }
     if (!n_draw) { g.dropped[ENG_DROP_EMPTY]++; return; }
@@ -2530,8 +2754,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     if (indexed) {
         if (!dc_reserve_indices(n_draw)) return;
         rsx_draw_engine_write_topology_indices(
-            prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
-            dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL,
+            prim, dc.n_source_refs, dc.csrc, dc.n_cuts, dc.rsrc,
             g.indices);
     }
 
@@ -2601,7 +2824,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
                           rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
 
     const u32 uploaded = indexed ? dc.n_verts : n_draw;
-    g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
+    g.be->draw(g.be->user, topology, dc.vsrc, uploaded, layout.stride,
                indexed ? g.indices : NULL, indexed ? n_draw : 0);
     /* Counted only when the draw ran the guest's OWN programs, which is what
      * the test hook means: a draw through the built-in pair is a draw, not
@@ -2816,6 +3039,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
     g.ready = 1;
+    eng_vx_init();
     /* Display buffers the title registered before the backend came up. */
     cellGcm_replay_display_buffers_to_engine();
     fprintf(stderr, "[rsx engine] register-file draw engine up (%ux%u)\n",
@@ -2841,6 +3065,7 @@ void rsx_draw_engine_shutdown(void)
     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
 
     rsx_draw_engine_set_guest_memory(NULL, NULL);
+    eng_vx_shutdown();
     free(dc.refs); free(dc.cuts); free(dc.verts);
     rsx_vertex_remap_destroy(&dc.ref_remap);
     memset(&dc, 0, sizeof dc);
@@ -2902,6 +3127,11 @@ void rsx_draw_engine_present_buffer(u32 buffer_id)
 void rsx_draw_engine_note_flip(u32 buffer_id)
 {
     g.last_flip_buffer = buffer_id & 7u;
+}
+
+void rsx_draw_engine_vertex_cache_stats(rsx_vcache_stats* out)
+{
+    rsx_vcache_get_stats(vx.cache, out);
 }
 
 u32 rsx_draw_engine_guest_draws(void)
