@@ -6,6 +6,7 @@
  * functions (not macros) means the SPU_DRAIN/SPU_RET call sites are already in
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
+#include "spu_ibf.h"
 #include "../../include/ps3emu/log_first.h"
 #include <setjmp.h>
 extern int g_spu_wws_pm_image;
@@ -400,6 +401,8 @@ extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 {
     spu_depth_guard(ctx);
+    const uint32_t ibf_n0 = ctx->ibf_ret_n;
+    spu_ibf_push(ctx, return_pc);
     /* The frame an interrupt taken in THIS loop returns to. It stays armed
      * after the handler's first host function returns -- the handler keeps
      * running as trampolines of this loop -- until its iret fires or the
@@ -413,6 +416,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                 (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
                 g_spu_trampoline_fn = 0;
                 SPU_DRAIN_POP_IRQ();
+                ctx->ibf_ret_n = ibf_n0;
                 return;
             }
             void (*fn)(spu_context*) = g_spu_trampoline_fn;
@@ -439,6 +443,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                         ctx->image_id = f.image_id;
                         g_spu_trampoline_fn = spu_indirect_branch;
                         SPU_DRAIN_POP_IRQ();
+                        ctx->ibf_ret_n = ibf_n0 + 1u;
                     }
                     continue;
                 }
@@ -447,6 +452,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
         }
         if ((ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
             SPU_DRAIN_POP_IRQ();
+            ctx->ibf_ret_n = ibf_n0;
             return;
         }
         {
@@ -465,6 +471,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
         {
             extern void spu_restart_dispatch(spu_context*);
             SPU_DRAIN_POP_IRQ();
+            ctx->ibf_ret_n = ibf_n0;
             spu_restart_dispatch(ctx);
             return;
         }

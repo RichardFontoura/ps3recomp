@@ -167,6 +167,8 @@ typedef struct spu_channel {
 /* ---------------------------------------------------------------------------
  * SPU execution context
  * -----------------------------------------------------------------------*/
+#define SPU_IBF_RET_MAX 16u
+
 typedef struct spu_context {
     /* 128 general-purpose 128-bit registers */
     SPU_ALIGN16 u128 gpr[128];
@@ -391,6 +393,9 @@ typedef struct spu_context {
      * and died in its own assert (the song-freeze). */
     uint32_t drain_ret_pc;
     uint32_t pic_base;
+    uint32_t ibf_ret_n;
+    uint32_t ibf_ret_depth[SPU_IBF_RET_MAX];
+    uint32_t ibf_ret_pc[SPU_IBF_RET_MAX];
 } spu_context;
 
 #define SPU_PIC(ctx, a) (((ctx)->pic_base + (uint32_t)(a)) & SPU_LS_MASK)

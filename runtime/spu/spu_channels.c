@@ -15,6 +15,7 @@
 #include "spu_dma.h"
 #include "spu_pic_match.h"
 #include "spu_regcache.h"
+#include "spu_ibf.h"
 #include "../../include/ps3emu/log_first.h"
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
@@ -42,6 +43,7 @@ extern "C" {
 extern int g_spu_wws_pm_image;
 extern int g_spu_wws_job_image;
 void spurs_kernel_temp_area_refresh(spu_context* ctx);
+static int s_spu_ibf = -1;
 static _Thread_local uint32_t t_smc_fallback_pc;
 
 static uint64_t spu_host_ns(void)
@@ -247,6 +249,8 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     ctx->host_depth = 0;
     ctx->irq_frame = 0;
     ctx->drain_ret_pc = 0;
+    const uint32_t ibf_saved = ctx->ibf_ret_n;
+    ctx->ibf_ret_n = 0;
     /* Nest-safe: a job run synchronously from inside another SPU's execution
      * re-enters here on the same host thread. The halt target is per-thread,
      * so save the outer one and put it back on the way out -- otherwise the
@@ -277,9 +281,8 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
         g_spu_trampoline_fn = 0;
         break;
     case 2:
-        /* A one-way guest stack reset invalidates every lifted host caller.
-         * Re-enter its target with the same guest state on the driver stack. */
         ctx->host_depth = 0;
+        ctx->ibf_ret_n = 0;
         g_spu_trampoline_fn = 0;
         spu_indirect_branch(ctx);
         SPU_DRAIN(ctx);
@@ -303,6 +306,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 #if SPU_FAST_FP_SUPPORTED
     _mm_setcsr(csr_saved);
 #endif
+    ctx->ibf_ret_n = ibf_saved;
     yz_lockstep_unregister(ctx);   /* leave the ring; hand the token onward */
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
@@ -2340,6 +2344,103 @@ static int spu_smc_microstep(spu_context* ctx)
         fprintf(stderr, "[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",
                 ctx->image_id, ctx->pc & SPU_LS_MASK); }
     return 0;
+}
+
+static void spu_ibf_init(void)
+{
+    static const char* const off_when[] = {
+        "SPU_IBCOV", "SPU_POLLTRACE", "SPU_JOBTRACE", "SPU_JOBEXEC", "LBP_HLE_JOBDONE", "YDKJ_CRI_CHAIN",
+    };
+    const char* e = getenv("SPU_IBF");
+    int on = !(e && e[0] == '0');
+    for (unsigned i = 0; on && i < sizeof off_when / sizeof off_when[0]; i++)
+        if (getenv(off_when[i])) on = 0;
+#if !defined(__clang__)
+    on = 0;
+#endif
+    s_spu_ibf = on;
+}
+
+static spu_fn spu_ibf_lookup(const spu_context* ctx, uint32_t t)
+{
+    if (ctx->irq_saved || t < 0x4000u || t >= 0x3E000u || t == 0x4A40u) return 0;
+    if (ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID || ctx->resident_task) return 0;
+    for (unsigned slot = 0; slot < 4; ++slot)
+        if (ctx->resident_code[slot].image_id) return 0;
+    if (spu_taskset_resident_image(ctx) || spu_taskset_task_image(t)) return 0;
+    spu_fn fn = ctx->resident_ovl ? spu_lookup(t, ctx->resident_ovl) : 0;
+    if (!fn) fn = spu_lookup(t, ctx->image_id);
+    return fn;
+}
+
+static spu_ibf_fn spu_ibf_take_impl(spu_context* ctx, uint32_t target, int is_return)
+{
+    if (s_spu_ibf <= 0) {
+        if (s_spu_ibf < 0) spu_ibf_init();
+        if (s_spu_ibf <= 0) return 0;
+    }
+    const uint32_t t = target & SPU_LS_MASK;
+    const uint32_t n = ctx->ibf_ret_n;
+    uint32_t ret_pc = 0;
+    if (n == 0) {
+        if (ctx->host_depth) return 0;
+    } else {
+        if (n > SPU_IBF_RET_MAX || ctx->ibf_ret_depth[n - 1u] != ctx->host_depth) return 0;
+        ret_pc = ctx->ibf_ret_pc[n - 1u];
+        if (t == ret_pc || ctx->int_enable) return 0;
+        if (is_return && ctx->host_depth &&
+            !((ctx->resident_ovl && spu_lookup(t, ctx->resident_ovl)) || spu_lookup(t, ctx->image_id)))
+            return 0;
+    }
+    ctx->pc = target;
+    if (n == 0) {
+        yz_lockstep_tick(ctx);
+        spu_task_launch_check(ctx, (void*)spu_indirect_branch);
+        void (*tf)(spu_context*) = spu_indirect_branch;
+        if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) tf = spu_take_interrupt(ctx, tf);
+        spu_pchist_tick(ctx);
+        g_spu_pch[g_spu_pch_n++ & 7u] = (uint32_t)(ctx->pc & SPU_LS_MASK);
+        if (tf != spu_indirect_branch) {
+            tf(ctx);
+            return SPU_IBF_HANDLED;
+        }
+    } else {
+        spu_depth_guard(ctx);
+        ctx->drain_ret_pc = ret_pc;
+        yz_lockstep_tick(ctx);
+        spu_task_launch_check(ctx, (void*)spu_indirect_branch);
+    }
+    const spu_fn fn = spu_ibf_lookup(ctx, t);
+    if (!fn) {
+        spu_indirect_branch(ctx);
+        return SPU_IBF_HANDLED;
+    }
+    ctx->pc &= SPU_LS_MASK;
+    spu_check_stack_reset(ctx, fn);
+    return (spu_ibf_fn)fn;
+}
+
+spu_ibf_fn spu_ibf_take(spu_context* ctx, uint32_t target)
+{
+    return spu_ibf_take_impl(ctx, target, 0);
+}
+
+spu_ibf_fn spu_ibf_take_return(spu_context* ctx, uint32_t target)
+{
+    return spu_ibf_take_impl(ctx, target, 1);
+}
+
+spu_ibf_fn spu_ibf_resolve_call(spu_context* ctx)
+{
+    if (s_spu_ibf <= 0) {
+        if (s_spu_ibf < 0) spu_ibf_init();
+        if (s_spu_ibf <= 0) return 0;
+    }
+    const spu_fn fn = spu_ibf_lookup(ctx, ctx->pc & SPU_LS_MASK);
+    if (!fn) return 0;
+    ctx->pc &= SPU_LS_MASK;
+    spu_check_stack_reset(ctx, fn);
+    return (spu_ibf_fn)fn;
 }
 
 void spu_indirect_branch(spu_context* ctx)

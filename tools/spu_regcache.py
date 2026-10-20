@@ -4,6 +4,9 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import spu_ibfast
+
 GPR = re.compile(r'ctx->gpr\[(\d+)\]')
 FHEAD = re.compile(r'^(?:static\s+)?void\s+\w+\(spu_context\*\s*ctx\)\s*\{\s*$')
 FNAME = re.compile(r'^(?:static\s+)?void\s+(\w+)\(spu_context\*\s*ctx\)\s*\{\s*$', re.M)
@@ -320,7 +323,7 @@ def twin(dst, src):
     return '\n'.join(lines + tail), len(public)
 
 
-def build_image(directory):
+def build_image(directory, ibf=True):
     path = os.path.join(directory, 'spu_recomp.c')
     src = open(path, encoding='utf-8', errors='surrogateescape').read()
     dst, functions = transform_file(src)
@@ -328,6 +331,8 @@ def build_image(directory):
     dst, n = HELPERS_INCLUDE.subn(r'\1\n#include "spu_helpers_vec.h"', dst, count=1)
     if not n:
         raise ValueError('no spu_helpers.h include')
+    if ibf:
+        dst, _ = spu_ibfast.transform(dst)
     target = os.path.join(directory, OUTPUT)
     if os.path.exists(target):
         with open(target, encoding='utf-8', errors='surrogateescape', newline='') as f:
@@ -344,6 +349,8 @@ def main():
     parser.add_argument('spu_dir')
     parser.add_argument('--only', action='append', default=[], help='image directory name to process (repeatable)')
     parser.add_argument('--clean', action='store_true', help='remove the twins instead of writing them')
+    parser.add_argument('--no-ibf', action='store_true', help='leave the computed branches on the full resolver '
+                        '(no spu_ibf.h lean dispatch)')
     args = parser.parse_args()
     total = 0
     skipped = 0
@@ -359,7 +366,7 @@ def main():
                 os.remove(target)
             continue
         try:
-            functions, pairs = build_image(directory)
+            functions, pairs = build_image(directory, not args.no_ibf)
         except ValueError as exc:
             skipped += 1
             target = os.path.join(directory, OUTPUT)
